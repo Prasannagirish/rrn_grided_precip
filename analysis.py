@@ -375,7 +375,7 @@ if cn_values:
     print(f"   Median Curve Number (CN):  {CN_median:.1f}")
     print(f"   Mean Curve Number (CN):    {CN_mean:.1f}")
     print(f"   Potential max retention (S): {S_avg:.1f} mm")
-    print(f"   Initial abstraction (Ia=0.2S): {0.2*S_avg:.1f} mm")
+    print(f"   Initial abstraction (Ia=0.3S): {0.3*S_avg:.1f} mm")
 
     # Plot: P-Q scatter with SCS curves
     fig, ax = plt.subplots(figsize=(8, 6))
