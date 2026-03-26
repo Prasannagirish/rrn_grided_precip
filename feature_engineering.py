@@ -111,16 +111,31 @@ df['is_monsoon'] = month.between(6, 9).astype(int)
 # log1p = log(x + 1), safely handles zeros.
 # log_q is the MODEL TARGET — reverse with np.expm1()
 # after prediction to recover real discharge values.
+#
+# FIX: Also log-transform rainfall_std_mm and rolling std
+#      features so every raw feature has a log counterpart.
+#      log_rainfall (today's rain) is kept for reference
+#      but must be DROPPED in training to avoid leakage.
 # --------------------------------------------------
 print("⚙️  Applying log transforms...")
 df['log_rainfall'] = np.log1p(df['rainfall_max_mm'])
 df['log_q']        = np.log1p(df['q_upstream_mk'])
+
+# FIX: log-transform rainfall_std_mm
+if 'rainfall_std_mm' in df.columns:
+    df['log_rainfall_std'] = np.log1p(df['rainfall_std_mm'])
 
 for lag in range(1, 8):
     df[f'log_rain_lag_{lag}d'] = np.log1p(df[f'rain_lag_{lag}d'])
 
 for window in [3, 7, 14, 30]:
     df[f'log_rain_roll_{window}d'] = np.log1p(df[f'rain_roll_{window}d'])
+
+# FIX: log-transform rolling std features (were previously
+#      dropped in training with no log counterpart, losing
+#      the rainfall variability signal entirely)
+for window in [7, 14]:
+    df[f'log_rain_rollstd_{window}d'] = np.log1p(df[f'rain_rollstd_{window}d'])
 
 for lag in range(1, 4):
     df[f'log_q_lag_{lag}d'] = np.log1p(df[f'q_lag_{lag}d'])

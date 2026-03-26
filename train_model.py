@@ -38,12 +38,20 @@ print(f"Feature dataset: {df.shape[0]} rows, {df.shape[1]} cols")
 #   - date            (not a numeric feature)
 #   - q_upstream_mk   (raw target, would leak)
 #   - log_q           (target itself)
+#   - log_rainfall    (today's rain — leaks future info;
+#                      at prediction time we don't have
+#                      today's total rainfall yet)
 #   - raw rainfall_max_mm / rainfall_std_mm / rain_lag_Xd
-#     / rain_roll_Xd  (replaced by their log versions)
+#     / rain_roll_Xd / rain_rollstd_Xd
+#     (replaced by their log versions)
 #   - raw q_lag_Xd    (replaced by log_q_lag_Xd)
 # --------------------------------------------------
 DROP_COLS = [
     'date', 'q_upstream_mk', 'log_q',
+    # FIX: drop log_rainfall — it uses today's rain, causing
+    #      data leakage (lags are shifted, this is not)
+    'log_rainfall',
+    # raw features (log counterparts are used instead)
     'rainfall_max_mm', 'rainfall_std_mm',
     'rain_lag_1d', 'rain_lag_2d', 'rain_lag_3d',
     'rain_lag_4d', 'rain_lag_5d', 'rain_lag_6d', 'rain_lag_7d',
@@ -54,7 +62,9 @@ DROP_COLS = [
 
 TARGET = 'log_q'
 
-feature_cols = [c for c in df.columns if c not in DROP_COLS + [TARGET]]
+# Only drop columns that actually exist in the dataframe
+drop_existing = [c for c in DROP_COLS if c in df.columns]
+feature_cols = [c for c in df.columns if c not in drop_existing + [TARGET]]
 print(f"\nFeatures used ({len(feature_cols)}):")
 for f in feature_cols:
     print(f"  {f}")
