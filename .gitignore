@@ -1,0 +1,28 @@
+# --- Virtual Environment ---
+venv/
+.venv/
+env/
+bin/
+lib/
+include/
+*.pyc
+__pycache__/
+
+# --- Data Files (Crucial for Hydrology) ---
+# We ignore the 'data' folder because NetCDF and CSV files are too large for Git
+data/
+*.nc
+*.zarr
+*.csv
+*.grib
+*.tif
+
+# --- Secret API Keys ---
+# Do NOT share your Copernicus credentials
+.cdsapirc
+
+# --- OS / IDE Specific ---
+.DS_Store
+.vscode/
+.idea/
+.ipynb_checkpoints/

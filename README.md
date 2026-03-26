@@ -1,2 +1,2 @@
-# rrn_grided_precip
+# rrn_gridded_precip
 mid-term-hydrology-project
