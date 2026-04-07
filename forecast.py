@@ -558,10 +558,14 @@ print(f"   📸 annual_peak_comparison.png")
 fig, ax = plt.subplots(figsize=(14, 5))
 
 # Monthly means across scenarios for the envelope
-all_q = np.column_stack([data['discharge'] for data in scenario_results.values()])
-q_min = all_q.min(axis=1)
-q_max = all_q.max(axis=1)
-q_avg = scenario_results['Average']['discharge']
+envelope_df = pd.DataFrame(index=future_dates)
+
+for name, data in scenario_results.items():
+    # Map the discharge values to their specific dates
+    envelope_df[name] = pd.Series(data['discharge'], index=data['dates'])
+q_min = envelope_df.min(axis=1).values
+q_max = envelope_df.max(axis=1).values
+q_avg = envelope_df['Average'].values
 
 # Smooth with 30-day rolling for readability
 window = 30
