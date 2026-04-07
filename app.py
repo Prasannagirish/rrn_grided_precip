@@ -567,7 +567,7 @@ with tab6:
 
 # ------ TAB 7: FORECAST ------
 with tab7:
-    st.markdown('<p class="sec-desc">Generate scenario-based discharge forecasts to 2030 using historical rainfall climatology. Four scenarios: Average, Wet (+20%), Dry (-20%), and Extreme (+40%) monsoon.</p>', unsafe_allow_html=True)
+    st.markdown('<p class="sec-desc">Generate scenario-based discharge forecasts to 2030 using historical rainfall climatology. Six scenarios: Average, Wet (+20%), Dry (-20%), and Extreme (+40%) monsoon, SSP245, SSP585.</p>', unsafe_allow_html=True)
 
     if not st.session_state.model_done:
         st.warning("Train the model (Step 5) first.")
