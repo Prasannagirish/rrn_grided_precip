@@ -120,7 +120,7 @@ st.markdown("""
 # ============================================================
 # SESSION STATE
 # ============================================================
-for key in ["data_uploaded", "eda_done", "hydro_done", "feat_done", "model_done"]:
+for key in ["data_uploaded", "eda_done", "hydro_done", "feat_done", "model_done", "forecast_done"]:
     if key not in st.session_state:
         st.session_state[key] = False
 
@@ -188,6 +188,9 @@ if dir_has_outputs(FEAT_DIR):
     st.session_state.feat_done = True
 if dir_has_outputs(MODEL_DIR):
     st.session_state.model_done = True
+FORECAST_DIR = BASE_DIR / "forecast_outputs"
+if dir_has_outputs(FORECAST_DIR):
+    st.session_state.forecast_done = True
 
 # ============================================================
 # HERO
@@ -205,9 +208,11 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ============================================================
-# STEP INDICATOR — 6 steps
+# STEP INDICATOR — 7 steps
 # ============================================================
-if st.session_state.model_done:
+if st.session_state.forecast_done:
+    active_step = 7
+elif st.session_state.model_done:
     active_step = 6
 elif st.session_state.feat_done:
     active_step = 5
@@ -221,12 +226,13 @@ else:
     active_step = 1
 
 steps_info = [
-    ("01", "Data Upload"),
+    ("01", "Upload"),
     ("02", "EDA"),
     ("03", "Hydrology"),
     ("04", "Features"),
     ("05", "Training"),
     ("06", "Results"),
+    ("07", "Forecast"),
 ]
 
 cards_html = '<div class="steps-row">'
@@ -249,13 +255,14 @@ st.markdown(cards_html, unsafe_allow_html=True)
 # ============================================================
 # TABS — 6 tabs
 # ============================================================
-tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
     "📂  Upload",
     "📊  EDA",
     "💧  Hydrology",
     "⚙️  Features",
     "🚀  Training",
     "📈  Results",
+    "🔮  Forecast",
 ])
 
 # ------ TAB 1: DATA UPLOAD ------
@@ -556,6 +563,46 @@ with tab6:
             )
     else:
         st.info("Predictions file not found.")
+
+
+# ------ TAB 7: FORECAST ------
+with tab7:
+    st.markdown('<p class="sec-desc">Generate scenario-based discharge forecasts to 2030 using historical rainfall climatology. Four scenarios: Average, Wet (+20%), Dry (-20%), and Extreme (+40%) monsoon.</p>', unsafe_allow_html=True)
+
+    if not st.session_state.model_done:
+        st.warning("Train the model (Step 5) first.")
+    else:
+        bcol, _ = st.columns([1, 3])
+        with bcol:
+            if st.button("▶  Run Forecast", type="primary", key="btn_forecast", use_container_width=True):
+                if run_script("forecast.py"):
+                    st.session_state.forecast_done = True
+                    st.rerun()
+
+        if st.session_state.forecast_done:
+            # Annual summary table
+            summary_csv = FORECAST_DIR / "forecast_annual_summary.csv"
+            if summary_csv.exists():
+                st.subheader("Annual Forecast Summary")
+                df_summary = pd.read_csv(summary_csv)
+                st.dataframe(
+                    df_summary.style.format({
+                        "mean_discharge_m3s": "{:,.1f}",
+                        "peak_discharge_m3s": "{:,.1f}",
+                        "total_rainfall_mm": "{:,.0f}",
+                    }),
+                    width="stretch", height=320,
+                )
+
+                st.download_button(
+                    label="⬇  Download forecast summary",
+                    data=summary_csv.read_bytes(),
+                    file_name="forecast_annual_summary.csv",
+                    mime="text/csv",
+                )
+
+            st.divider()
+            show_images(FORECAST_DIR, cols=2)
 
 
 # ============================================================
