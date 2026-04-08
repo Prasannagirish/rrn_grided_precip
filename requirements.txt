@@ -1,7 +1,4 @@
-# Core Web App
 streamlit
-
-# Data Processing & Geospatial (Based on your list)
 pandas
 numpy
 geopandas
@@ -9,12 +6,8 @@ xarray
 netCDF4
 rioxarray
 imdlib
-
-# Visualization
 matplotlib
 plotly
 folium
-
-# Machine Learning
 tensorflow
 scikit-learn
