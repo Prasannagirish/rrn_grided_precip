@@ -202,7 +202,9 @@ st.markdown("""
     End-to-end ML pipeline — from raw <span class="hl">CHIRPS rainfall</span>
     and <span class="hl">CWC discharge</span> data through
     <span class="hl">hydrological analysis</span> to
-    <span class="hl">XGBoost + LSTM predictions</span>.
+    <span class="hl">XGBoost + LSTM predictions</span>
+    and future scenarios forecasting derived from 
+    <span class="hl">CMIP-6 models</span>.
   </p>
 </div>
 """, unsafe_allow_html=True)
@@ -567,7 +569,7 @@ with tab6:
 
 # ------ TAB 7: FORECAST ------
 with tab7:
-    st.markdown('<p class="sec-desc">Generate scenario-based discharge forecasts to 2030 using historical rainfall climatology. Six scenarios: Average, Wet (+20%), Dry (-20%), and Extreme (+40%) monsoon, SSP245, SSP585.</p>', unsafe_allow_html=True)
+    st.markdown('<p class="sec-desc">Generate discharge forecasts up to the year 2030.</p>', unsafe_allow_html=True)
 
     if not st.session_state.model_done:
         st.warning("Train the model (Step 5) first.")
@@ -585,6 +587,11 @@ with tab7:
             if summary_csv.exists():
                 st.subheader("Annual Forecast Summary")
                 df_summary = pd.read_csv(summary_csv)
+                
+                # Filter out the unwanted scenarios dynamically before displaying
+                unwanted_scenarios = ['Average', 'Wet', 'Dry', 'Extreme']
+                df_summary = df_summary[~df_summary['scenario'].astype(str).str.contains('|'.join(unwanted_scenarios), case=False, na=False)]
+                
                 st.dataframe(
                     df_summary.style.format({
                         "mean_discharge_m3s": "{:,.1f}",
@@ -594,10 +601,13 @@ with tab7:
                     width="stretch", height=320,
                 )
 
+                # Create a filtered CSV for the download button
+                filtered_csv = df_summary.to_csv(index=False).encode('utf-8')
+
                 st.download_button(
                     label="⬇  Download forecast summary",
-                    data=summary_csv.read_bytes(),
-                    file_name="forecast_annual_summary.csv",
+                    data=filtered_csv,
+                    file_name="forecast_annual_summary_filtered.csv",
                     mime="text/csv",
                 )
 

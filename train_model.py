@@ -91,9 +91,13 @@ y = df[TARGET]
 
 # --------------------------------------------------
 # 3-WAY TEMPORAL SPLIT
+#
+# Train : everything before 2012-01-01
+# Val   : 2012-01-01 → 2014-12-31 (tuning + early stopping)
+# Test  : 2015-01-01 onwards      (final evaluation, untouched)
 # --------------------------------------------------
-val_start  = pd.Timestamp('2016-01-01')
-test_start = pd.Timestamp('2018-01-01')
+val_start  = pd.Timestamp('2012-01-01')
+test_start = pd.Timestamp('2015-01-01')
 
 train_mask = df['date'] < val_start
 val_mask   = (df['date'] >= val_start) & (df['date'] < test_start)
