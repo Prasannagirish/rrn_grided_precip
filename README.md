@@ -186,3 +186,4 @@ Dark-theme native with step indicators, metric tiles, image galleries, and CSV d
 ## License
 
 Academic project — Kabini Basin Discharge Forecasting Pipeline.
+Author - Girish Prasanna M
