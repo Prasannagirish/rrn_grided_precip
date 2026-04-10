@@ -298,7 +298,7 @@ def show_interactive_forecast(forecast_dir: Path, master_path: Path, key_prefix:
     fig1 = go.Figure()
     if df_hist is not None:
         fig1.add_trace(go.Scatter(x=df_hist['date'], y=df_hist['q_upstream_mk'],
-                                  name='Historical', line=dict(color='#1a1a1a', width=0.7), opacity=0.5))
+                                  name='Historical', line=dict(color="#2315be", width=0.7), opacity=0.5))
     for label, fpath in available.items():
         df_f = pd.read_csv(fpath); df_f['date'] = pd.to_datetime(df_f['date'])
         fig1.add_trace(go.Scatter(x=df_f['date'], y=df_f['discharge_m3s'],

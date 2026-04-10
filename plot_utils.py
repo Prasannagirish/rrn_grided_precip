@@ -34,10 +34,10 @@ except ImportError:
 
 # Consistent color palette across all plots
 COLORS = {
-    'observed':    '#1a1a1a',
+    'observed':    "#272cba",
     'xgb':         '#2E86C1',
     'lgb':         '#1ABC9C',
-    'ridge':       '#95A5A6',
+    'ridge':       "#0DC8D6",
     'ensemble':    '#2E86C1',
     'lstm':        '#E74C3C',
     'hybrid':      '#27AE60',
