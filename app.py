@@ -128,7 +128,7 @@ for key in ["data_uploaded", "eda_done", "hydro_done", "feat_done", "model_done"
 # HELPERS
 # ============================================================
 def dir_has_outputs(directory: Path) -> bool:
-    return directory.exists() and any(directory.glob("*.png"))
+    return directory.exists() and (any(directory.glob("*.png")) or any(directory.glob("*.json")))
 
 def run_script(script_name: str) -> bool:
     script_path = BASE_DIR / script_name
@@ -151,23 +151,184 @@ def run_script(script_name: str) -> bool:
             st.code(result.stderr, language="text")
         return False
 
-def show_images(directory: Path, cols: int = 2):
+def show_plots(directory: Path, cols: int = 2):
+    """Display static PNG plots from a directory."""
     if not directory.exists():
         st.info("No outputs yet — run this step first.")
         return
-    images = sorted(directory.glob("*.png"))
-    if not images:
+    png_files = sorted(directory.glob("*.png"))
+    if not png_files:
         st.info("No plots generated yet.")
         return
     grid = st.columns(cols)
-    for i, img_path in enumerate(images):
+    for i, img_path in enumerate(png_files):
         with grid[i % cols]:
-            img = Image.open(img_path)
-            st.image(img, width="stretch")
+            st.image(Image.open(img_path), width="stretch")
             st.markdown(
                 f'<p class="gallery-caption">{img_path.stem.replace("_", " ").title()}</p>',
                 unsafe_allow_html=True,
             )
+
+def show_interactive_results(model_dir: Path, key_prefix: str = "model"):
+    """Build interactive Plotly charts from model output CSVs."""
+    try:
+        import plotly.graph_objects as go
+        from plotly.subplots import make_subplots
+    except ImportError:
+        show_plots(model_dir)
+        return
+
+    preds_csv = model_dir / "test_predictions.csv"
+    comp_csv  = model_dir / "model_comparison.csv"
+
+    if not preds_csv.exists():
+        show_plots(model_dir)
+        return
+
+    df_p = pd.read_csv(preds_csv)
+    df_p['date'] = pd.to_datetime(df_p['date'])
+    pred_col = get_pred_column(df_p)
+    if pred_col is None:
+        show_plots(model_dir)
+        return
+
+    # --- Time-series overlay ---
+    fig1 = go.Figure()
+    fig1.add_trace(go.Scatter(x=df_p['date'], y=df_p['observed'], name='Observed',
+                              line=dict(color='#1a1a1a', width=1), opacity=0.85))
+    fig1.add_trace(go.Scatter(x=df_p['date'], y=df_p[pred_col], name='XGB Ensemble',
+                              line=dict(color='#2E86C1', width=1), opacity=0.8))
+    if 'lstm' in df_p.columns:
+        fig1.add_trace(go.Scatter(x=df_p['date'], y=df_p['lstm'], name='LSTM',
+                                  line=dict(color='#E74C3C', width=1), opacity=0.8))
+    if 'hybrid' in df_p.columns:
+        fig1.add_trace(go.Scatter(x=df_p['date'], y=df_p['hybrid'], name='Hybrid',
+                                  line=dict(color='#27AE60', width=1, dash='dash'), opacity=0.8))
+    fig1.update_layout(title='Observed vs Predicted Discharge', xaxis_title='Date',
+                       yaxis_title='Discharge (m³/s)', hovermode='x unified', height=450,
+                       template='plotly_dark')
+    st.plotly_chart(fig1, use_container_width=True, key=f"{key_prefix}_ts")
+
+    # --- Scatter comparison ---
+    n_cols = 1 + ('lstm' in df_p.columns)
+    titles = ['XGB Ensemble'] + (['LSTM'] if 'lstm' in df_p.columns else [])
+    fig2 = make_subplots(rows=1, cols=n_cols, subplot_titles=titles)
+    max_v = max(df_p['observed'].max(), df_p[pred_col].max()) * 1.05
+
+    fig2.add_trace(go.Scatter(x=df_p['observed'], y=df_p[pred_col], mode='markers',
+                              marker=dict(color='#2E86C1', size=3, opacity=0.4),
+                              showlegend=False), row=1, col=1)
+    fig2.add_trace(go.Scatter(x=[0, max_v], y=[0, max_v], mode='lines',
+                              line=dict(color='red', dash='dash', width=1), showlegend=False), row=1, col=1)
+
+    if 'lstm' in df_p.columns:
+        df_l = df_p.dropna(subset=['lstm'])
+        fig2.add_trace(go.Scatter(x=df_l['observed'], y=df_l['lstm'], mode='markers',
+                                  marker=dict(color='#E74C3C', size=3, opacity=0.4),
+                                  showlegend=False), row=1, col=2)
+        fig2.add_trace(go.Scatter(x=[0, max_v], y=[0, max_v], mode='lines',
+                                  line=dict(color='red', dash='dash', width=1), showlegend=False), row=1, col=2)
+
+    fig2.update_layout(title='Scatter: Observed vs Predicted', height=450, template='plotly_dark')
+    st.plotly_chart(fig2, use_container_width=True, key=f"{key_prefix}_scatter")
+
+    # --- Model comparison bars ---
+    if comp_csv.exists():
+        df_c = pd.read_csv(comp_csv)
+        colors = ['#3498DB', '#95A5A6', '#2E86C1', '#1ABC9C', '#E74C3C', '#27AE60']
+        fig3 = make_subplots(rows=1, cols=3, subplot_titles=['RMSE (m³/s)', 'MAE (m³/s)', 'NSE'])
+        for ci, metric in enumerate(['RMSE', 'MAE', 'NSE']):
+            col = metric if metric in df_c.columns else metric.upper()
+            if col not in df_c.columns:
+                continue
+            fig3.add_trace(go.Bar(y=df_c['Model'], x=df_c[col], orientation='h',
+                                  marker_color=colors[:len(df_c)], showlegend=False,
+                                  text=df_c[col].apply(lambda v: f"{v:.4f}" if metric == 'NSE' else f"{v:.1f}"),
+                                  textposition='outside'), row=1, col=ci+1)
+        fig3.update_layout(title='Model Comparison', height=380, template='plotly_dark')
+        st.plotly_chart(fig3, use_container_width=True, key=f"{key_prefix}_bars")
+
+    # --- Residuals ---
+    if 'residual' in df_p.columns:
+        fig4 = make_subplots(rows=1, cols=2, subplot_titles=['Residuals vs Predicted', 'Distribution'])
+        fig4.add_trace(go.Scatter(x=df_p[pred_col], y=df_p['residual'], mode='markers',
+                                  marker=dict(color='#2E86C1', size=3, opacity=0.3), showlegend=False), row=1, col=1)
+        fig4.add_hline(y=0, line_dash='dash', line_color='red', row=1, col=1)
+        fig4.add_trace(go.Histogram(x=df_p['residual'], nbinsx=60,
+                                    marker_color='#2E86C1', showlegend=False), row=1, col=2)
+        fig4.add_vline(x=0, line_dash='dash', line_color='red', row=1, col=2)
+        fig4.update_layout(title='Residual Analysis', height=380, template='plotly_dark')
+        st.plotly_chart(fig4, use_container_width=True, key=f"{key_prefix}_resid")
+
+    # Remaining PNGs (feature importance, monthly NSE, etc.)
+    interactive_stems = {'obs_vs_pred_timeseries', 'scatter_obs_vs_pred', 'comparison_metrics_bar',
+                         'comparison_scatter', 'comparison_timeseries', 'residual_analysis'}
+    remaining = [p for p in sorted(model_dir.glob("*.png")) if p.stem not in interactive_stems]
+    if remaining:
+        grid = st.columns(2)
+        for i, img_path in enumerate(remaining):
+            with grid[i % 2]:
+                st.image(Image.open(img_path), width="stretch")
+                st.markdown(f'<p class="gallery-caption">{img_path.stem.replace("_", " ").title()}</p>',
+                            unsafe_allow_html=True)
+
+def show_interactive_forecast(forecast_dir: Path, master_path: Path, key_prefix: str = "fcast"):
+    """Build interactive Plotly charts from forecast CSVs."""
+    try:
+        import plotly.graph_objects as go
+    except ImportError:
+        show_plots(forecast_dir)
+        return
+
+    ssp_files = {'SSP2-4.5': forecast_dir / 'forecast_ssp245.csv',
+                 'SSP5-8.5': forecast_dir / 'forecast_ssp585.csv'}
+    ssp_colors = {'SSP2-4.5': '#8E44AD', 'SSP5-8.5': '#C0392B'}
+    available = {k: v for k, v in ssp_files.items() if v.exists()}
+
+    if not available:
+        show_plots(forecast_dir)
+        return
+
+    df_hist = None
+    if master_path.exists():
+        df_h = pd.read_csv(master_path)
+        df_h['date'] = pd.to_datetime(df_h['date'])
+        df_hist = df_h.tail(1095)
+
+    fig1 = go.Figure()
+    if df_hist is not None:
+        fig1.add_trace(go.Scatter(x=df_hist['date'], y=df_hist['q_upstream_mk'],
+                                  name='Historical', line=dict(color='#1a1a1a', width=0.7), opacity=0.5))
+    for label, fpath in available.items():
+        df_f = pd.read_csv(fpath); df_f['date'] = pd.to_datetime(df_f['date'])
+        fig1.add_trace(go.Scatter(x=df_f['date'], y=df_f['discharge_m3s'],
+                                  name=label, line=dict(color=ssp_colors[label], width=1)))
+    fig1.update_layout(title='Kabini Discharge — CMIP6 Forecasts (2025–2030)',
+                       xaxis_title='Date', yaxis_title='Discharge (m³/s)',
+                       hovermode='x unified', height=450, template='plotly_dark')
+    st.plotly_chart(fig1, use_container_width=True, key=f"{key_prefix}_ts")
+
+    fig2 = go.Figure()
+    for label, fpath in available.items():
+        df_f = pd.read_csv(fpath); df_f['date'] = pd.to_datetime(df_f['date'])
+        mask = (df_f['date'] >= '2026-04-01') & (df_f['date'] <= '2026-11-30')
+        df_z = df_f[mask]
+        fig2.add_trace(go.Scatter(x=df_z['date'], y=df_z['discharge_m3s'],
+                                  name=label, line=dict(color=ssp_colors[label], width=1.3)))
+    fig2.update_layout(title='2026 Monsoon — Discharge Forecast',
+                       xaxis_title='Date', yaxis_title='Discharge (m³/s)',
+                       hovermode='x unified', height=400, template='plotly_dark')
+    st.plotly_chart(fig2, use_container_width=True, key=f"{key_prefix}_monsoon")
+
+    shown = {'cmip6_forecast_full', 'cmip6_monsoon_2026'}
+    leftover = [p for p in sorted(forecast_dir.glob("*.png")) if p.stem not in shown]
+    if leftover:
+        grid = st.columns(2)
+        for i, p in enumerate(leftover):
+            with grid[i % 2]:
+                st.image(Image.open(p), width="stretch")
+                st.markdown(f'<p class="gallery-caption">{p.stem.replace("_", " ").title()}</p>',
+                            unsafe_allow_html=True)
 
 def get_pred_column(df_res):
     """Find the prediction column — handles both old ('predicted')
@@ -202,9 +363,7 @@ st.markdown("""
     End-to-end ML pipeline — from raw <span class="hl">CHIRPS rainfall</span>
     and <span class="hl">CWC discharge</span> data through
     <span class="hl">hydrological analysis</span> to
-    <span class="hl">XGBoost + LSTM predictions</span>
-    and future scenarios forecasting derived from 
-    <span class="hl">CMIP-6 models</span>.
+    <span class="hl">XGBoost + LSTM predictions</span>.
   </p>
 </div>
 """, unsafe_allow_html=True)
@@ -317,7 +476,7 @@ with tab2:
                     st.rerun()
         if st.session_state.eda_done:
             st.divider()
-            show_images(EDA_DIR, cols=2)
+            show_plots(EDA_DIR, cols=2)
 
 
 # ------ TAB 3: HYDROLOGY ANALYSIS ------
@@ -398,7 +557,7 @@ with tab3:
                 )
 
             st.divider()
-            show_images(HYDRO_DIR, cols=2)
+            show_plots(HYDRO_DIR, cols=2)
 
 
 # ------ TAB 4: FEATURE ENGINEERING ------
@@ -421,7 +580,7 @@ with tab4:
                 with st.expander("Feature → log_q correlations"):
                     st.dataframe(pd.read_csv(corr_csv, index_col=0), width="stretch", height=300)
             st.divider()
-            show_images(FEAT_DIR, cols=2)
+            show_plots(FEAT_DIR, cols=2)
 
 
 # ------ TAB 5: MODEL TRAINING ------
@@ -446,7 +605,7 @@ with tab5:
                 st.dataframe(pd.read_csv(comp_csv), width="stretch", height=240)
 
             st.divider()
-            show_images(MODEL_DIR, cols=2)
+            show_interactive_results(MODEL_DIR, key_prefix="train")
 
 
 # ------ TAB 6: RESULTS ------
@@ -537,7 +696,7 @@ with tab6:
                     """, unsafe_allow_html=True)
 
             st.write("")
-            show_images(MODEL_DIR, cols=2)
+            show_interactive_results(MODEL_DIR, key_prefix="results")
 
             st.divider()
             st.subheader("Test Set Predictions")
@@ -569,7 +728,7 @@ with tab6:
 
 # ------ TAB 7: FORECAST ------
 with tab7:
-    st.markdown('<p class="sec-desc">Generate discharge forecasts up to the year 2030.</p>', unsafe_allow_html=True)
+    st.markdown('<p class="sec-desc">Generate scenario-based discharge forecasts to 2030 using historical rainfall climatology. Four scenarios: Average, Wet (+20%), Dry (-20%), and Extreme (+40%) monsoon.</p>', unsafe_allow_html=True)
 
     if not st.session_state.model_done:
         st.warning("Train the model (Step 5) first.")
@@ -587,11 +746,6 @@ with tab7:
             if summary_csv.exists():
                 st.subheader("Annual Forecast Summary")
                 df_summary = pd.read_csv(summary_csv)
-                
-                # Filter out the unwanted scenarios dynamically before displaying
-                unwanted_scenarios = ['Average', 'Wet', 'Dry', 'Extreme']
-                df_summary = df_summary[~df_summary['scenario'].astype(str).str.contains('|'.join(unwanted_scenarios), case=False, na=False)]
-                
                 st.dataframe(
                     df_summary.style.format({
                         "mean_discharge_m3s": "{:,.1f}",
@@ -601,18 +755,15 @@ with tab7:
                     width="stretch", height=320,
                 )
 
-                # Create a filtered CSV for the download button
-                filtered_csv = df_summary.to_csv(index=False).encode('utf-8')
-
                 st.download_button(
                     label="⬇  Download forecast summary",
-                    data=filtered_csv,
-                    file_name="forecast_annual_summary_filtered.csv",
+                    data=summary_csv.read_bytes(),
+                    file_name="forecast_annual_summary.csv",
                     mime="text/csv",
                 )
 
             st.divider()
-            show_images(FORECAST_DIR, cols=2)
+            show_interactive_forecast(FORECAST_DIR, DATA_DIR / "master_dataset.csv")
 
 
 # ============================================================
