@@ -195,7 +195,7 @@ def show_interactive_results(model_dir: Path, key_prefix: str = "model"):
     # --- Time-series overlay ---
     fig1 = go.Figure()
     fig1.add_trace(go.Scatter(x=df_p['date'], y=df_p['observed'], name='Observed',
-                              line=dict(color='#1a1a1a', width=1), opacity=0.85))
+                              line=dict(color="#f5f5f5", width=1), opacity=0.85))
     fig1.add_trace(go.Scatter(x=df_p['date'], y=df_p[pred_col], name='XGB Ensemble',
                               line=dict(color='#2E86C1', width=1), opacity=0.8))
     if 'lstm' in df_p.columns:
