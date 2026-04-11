@@ -195,41 +195,66 @@ def show_interactive_results(model_dir: Path, key_prefix: str = "model"):
     # --- Time-series overlay ---
     fig1 = go.Figure()
     fig1.add_trace(go.Scatter(x=df_p['date'], y=df_p['observed'], name='Observed',
-                              line=dict(color="#f5f5f5", width=1), opacity=0.85))
+                              line=dict(color='#1a1a1a', width=1.2), opacity=0.85))
+    if 'ridge' in df_p.columns:
+        fig1.add_trace(go.Scatter(x=df_p['date'], y=df_p['ridge'], name='Ridge (best)',
+                                  line=dict(color='#F39C12', width=1.5), opacity=0.9))
     fig1.add_trace(go.Scatter(x=df_p['date'], y=df_p[pred_col], name='XGB Ensemble',
-                              line=dict(color='#2E86C1', width=1), opacity=0.8))
+                              line=dict(color='#2E86C1', width=1), opacity=0.7))
     if 'lstm' in df_p.columns:
         fig1.add_trace(go.Scatter(x=df_p['date'], y=df_p['lstm'], name='LSTM',
-                                  line=dict(color='#E74C3C', width=1), opacity=0.8))
+                                  line=dict(color='#E74C3C', width=1), opacity=0.7))
     if 'hybrid' in df_p.columns:
         fig1.add_trace(go.Scatter(x=df_p['date'], y=df_p['hybrid'], name='Hybrid',
-                                  line=dict(color='#27AE60', width=1, dash='dash'), opacity=0.8))
-    fig1.update_layout(title='Observed vs Predicted Discharge', xaxis_title='Date',
-                       yaxis_title='Discharge (m³/s)', hovermode='x unified', height=450,
+                                  line=dict(color='#27AE60', width=1, dash='dash'), opacity=0.7))
+    fig1.update_layout(title='Observed vs Predicted Discharge — All Models', xaxis_title='Date',
+                       yaxis_title='Discharge (m³/s)', hovermode='x unified', height=480,
                        template='plotly_dark')
     st.plotly_chart(fig1, use_container_width=True, key=f"{key_prefix}_ts")
 
-    # --- Scatter comparison ---
-    n_cols = 1 + ('lstm' in df_p.columns)
-    titles = ['XGB Ensemble'] + (['LSTM'] if 'lstm' in df_p.columns else [])
+    # --- Scatter comparison (Ridge + XGB + LSTM) ---
+    has_ridge = 'ridge' in df_p.columns
+    has_lstm  = 'lstm' in df_p.columns
+    n_cols = 1 + has_ridge + has_lstm
+    titles = []
+    if has_ridge: titles.append('Ridge (best, NSE=0.890)')
+    titles.append('XGB Ensemble')
+    if has_lstm: titles.append('LSTM')
+
     fig2 = make_subplots(rows=1, cols=n_cols, subplot_titles=titles)
-    max_v = max(df_p['observed'].max(), df_p[pred_col].max()) * 1.05
+    max_v = df_p['observed'].max() * 1.05
+    col_idx = 1
+
+    if has_ridge:
+        fig2.add_trace(go.Scatter(x=df_p['observed'], y=df_p['ridge'], mode='markers',
+                                  marker=dict(color='#F39C12', size=4, opacity=0.5),
+                                  showlegend=False), row=1, col=col_idx)
+        fig2.add_trace(go.Scatter(x=[0, max_v], y=[0, max_v], mode='lines',
+                                  line=dict(color='red', dash='dash', width=1), showlegend=False), row=1, col=col_idx)
+        fig2.update_xaxes(title_text='Observed (m³/s)', row=1, col=col_idx)
+        fig2.update_yaxes(title_text='Predicted (m³/s)', row=1, col=col_idx)
+        col_idx += 1
 
     fig2.add_trace(go.Scatter(x=df_p['observed'], y=df_p[pred_col], mode='markers',
                               marker=dict(color='#2E86C1', size=3, opacity=0.4),
-                              showlegend=False), row=1, col=1)
+                              showlegend=False), row=1, col=col_idx)
     fig2.add_trace(go.Scatter(x=[0, max_v], y=[0, max_v], mode='lines',
-                              line=dict(color='red', dash='dash', width=1), showlegend=False), row=1, col=1)
+                              line=dict(color='red', dash='dash', width=1), showlegend=False), row=1, col=col_idx)
+    fig2.update_xaxes(title_text='Observed (m³/s)', row=1, col=col_idx)
+    fig2.update_yaxes(title_text='Predicted (m³/s)', row=1, col=col_idx)
+    col_idx += 1
 
-    if 'lstm' in df_p.columns:
+    if has_lstm:
         df_l = df_p.dropna(subset=['lstm'])
         fig2.add_trace(go.Scatter(x=df_l['observed'], y=df_l['lstm'], mode='markers',
                                   marker=dict(color='#E74C3C', size=3, opacity=0.4),
-                                  showlegend=False), row=1, col=2)
+                                  showlegend=False), row=1, col=col_idx)
         fig2.add_trace(go.Scatter(x=[0, max_v], y=[0, max_v], mode='lines',
-                                  line=dict(color='red', dash='dash', width=1), showlegend=False), row=1, col=2)
+                                  line=dict(color='red', dash='dash', width=1), showlegend=False), row=1, col=col_idx)
+        fig2.update_xaxes(title_text='Observed (m³/s)', row=1, col=col_idx)
+        fig2.update_yaxes(title_text='Predicted (m³/s)', row=1, col=col_idx)
 
-    fig2.update_layout(title='Scatter: Observed vs Predicted', height=450, template='plotly_dark')
+    fig2.update_layout(title='Scatter Comparison: Ridge vs XGB vs LSTM', height=450, template='plotly_dark')
     st.plotly_chart(fig2, use_container_width=True, key=f"{key_prefix}_scatter")
 
     # --- Model comparison bars ---
@@ -248,17 +273,32 @@ def show_interactive_results(model_dir: Path, key_prefix: str = "model"):
         fig3.update_layout(title='Model Comparison', height=380, template='plotly_dark')
         st.plotly_chart(fig3, use_container_width=True, key=f"{key_prefix}_bars")
 
-    # --- Residuals ---
-    if 'residual' in df_p.columns:
-        fig4 = make_subplots(rows=1, cols=2, subplot_titles=['Residuals vs Predicted', 'Distribution'])
-        fig4.add_trace(go.Scatter(x=df_p[pred_col], y=df_p['residual'], mode='markers',
-                                  marker=dict(color='#2E86C1', size=3, opacity=0.3), showlegend=False), row=1, col=1)
-        fig4.add_hline(y=0, line_dash='dash', line_color='red', row=1, col=1)
-        fig4.add_trace(go.Histogram(x=df_p['residual'], nbinsx=60,
-                                    marker_color='#2E86C1', showlegend=False), row=1, col=2)
-        fig4.add_vline(x=0, line_dash='dash', line_color='red', row=1, col=2)
-        fig4.update_layout(title='Residual Analysis', height=380, template='plotly_dark')
-        st.plotly_chart(fig4, use_container_width=True, key=f"{key_prefix}_resid")
+    # --- Residuals (use Ridge if available as it's the best model) ---
+    resid_col = pred_col
+    resid_label = 'XGB Ensemble'
+    resid_color = '#2E86C1'
+    if 'ridge' in df_p.columns:
+        df_p['ridge_residual'] = df_p['observed'] - df_p['ridge']
+        resid_col = 'ridge'
+        resid_label = 'Ridge'
+        resid_color = '#F39C12'
+
+    resid_x = df_p[resid_col] if resid_col == pred_col else df_p['ridge']
+    resid_y = df_p['residual'] if resid_col == pred_col else df_p['ridge_residual']
+
+    fig4 = make_subplots(rows=1, cols=2,
+                         subplot_titles=[f'Residuals vs Predicted ({resid_label})', 'Residual Distribution'])
+    fig4.add_trace(go.Scatter(x=resid_x, y=resid_y, mode='markers',
+                              marker=dict(color=resid_color, size=3, opacity=0.3), showlegend=False), row=1, col=1)
+    fig4.add_hline(y=0, line_dash='dash', line_color='red', row=1, col=1)
+    fig4.add_trace(go.Histogram(x=resid_y, nbinsx=60,
+                                marker_color=resid_color, showlegend=False), row=1, col=2)
+    fig4.add_vline(x=0, line_dash='dash', line_color='red', row=1, col=2)
+    fig4.update_xaxes(title_text=f'Predicted (m³/s)', row=1, col=1)
+    fig4.update_yaxes(title_text='Residual (m³/s)', row=1, col=1)
+    fig4.update_xaxes(title_text='Residual (m³/s)', row=1, col=2)
+    fig4.update_layout(title=f'Residual Analysis — {resid_label} (Best Model)', height=400, template='plotly_dark')
+    st.plotly_chart(fig4, use_container_width=True, key=f"{key_prefix}_resid")
 
     # Remaining PNGs (feature importance, monthly NSE, etc.)
     interactive_stems = {'obs_vs_pred_timeseries', 'scatter_obs_vs_pred', 'comparison_metrics_bar',
@@ -298,7 +338,7 @@ def show_interactive_forecast(forecast_dir: Path, master_path: Path, key_prefix:
     fig1 = go.Figure()
     if df_hist is not None:
         fig1.add_trace(go.Scatter(x=df_hist['date'], y=df_hist['q_upstream_mk'],
-                                  name='Historical', line=dict(color="#2315be", width=0.7), opacity=0.5))
+                                  name='Historical', line=dict(color='#1a1a1a', width=0.7), opacity=0.5))
     for label, fpath in available.items():
         df_f = pd.read_csv(fpath); df_f['date'] = pd.to_datetime(df_f['date'])
         fig1.add_trace(go.Scatter(x=df_f['date'], y=df_f['discharge_m3s'],
@@ -635,22 +675,51 @@ with tab6:
             r2  = 1 - ss_res / ss_tot
             nse = r2
 
+            # Ridge metrics (best model) — show first if available
+            if 'ridge' in df_res.columns:
+                ridge_v = df_res['ridge'].values
+                r_rmse = np.sqrt(np.mean((obs - ridge_v) ** 2))
+                r_mae  = np.mean(np.abs(obs - ridge_v))
+                r_ss   = np.sum((obs - ridge_v) ** 2)
+                r_nse  = 1 - r_ss / ss_tot
+
+                st.markdown(f"""
+                <div class="metric-row">
+                  <div class="metric-tile" style="border-color:rgba(243,156,18,.4); background:rgba(243,156,18,.08);">
+                    <div class="label" style="color:#F39C12;">⭐ Ridge RMSE</div>
+                    <div class="value">{r_rmse:,.2f}</div>
+                  </div>
+                  <div class="metric-tile" style="border-color:rgba(243,156,18,.4); background:rgba(243,156,18,.08);">
+                    <div class="label" style="color:#F39C12;">⭐ Ridge MAE</div>
+                    <div class="value">{r_mae:,.2f}</div>
+                  </div>
+                  <div class="metric-tile" style="border-color:rgba(243,156,18,.4); background:rgba(243,156,18,.08);">
+                    <div class="label" style="color:#F39C12;">⭐ Ridge R²</div>
+                    <div class="value">{r_nse:.4f}</div>
+                  </div>
+                  <div class="metric-tile" style="border-color:rgba(243,156,18,.4); background:rgba(243,156,18,.08);">
+                    <div class="label" style="color:#F39C12;">⭐ Ridge NSE</div>
+                    <div class="value">{r_nse:.4f}</div>
+                  </div>
+                </div>
+                """, unsafe_allow_html=True)
+
             st.markdown(f"""
             <div class="metric-row">
               <div class="metric-tile">
-                <div class="label">RMSE (m³/s)</div>
+                <div class="label">XGB Ens. RMSE</div>
                 <div class="value">{rmse:,.2f}</div>
               </div>
               <div class="metric-tile">
-                <div class="label">MAE (m³/s)</div>
+                <div class="label">XGB Ens. MAE</div>
                 <div class="value">{mae:,.2f}</div>
               </div>
               <div class="metric-tile">
-                <div class="label">R²</div>
+                <div class="label">XGB Ens. R²</div>
                 <div class="value">{r2:.4f}</div>
               </div>
               <div class="metric-tile">
-                <div class="label">NSE</div>
+                <div class="label">XGB Ens. NSE</div>
                 <div class="value">{nse:.4f}</div>
               </div>
             </div>
@@ -728,7 +797,7 @@ with tab6:
 
 # ------ TAB 7: FORECAST ------
 with tab7:
-    st.markdown('<p class="sec-desc">Generate scenario-based discharge forecasts to 2030 using historical rainfall climatology. Two scenarios: SSP2-4.5, SSP5-8.5.</p>', unsafe_allow_html=True)
+    st.markdown('<p class="sec-desc">Generate scenario-based discharge forecasts to 2030 using historical rainfall climatology. Two scenarios: SSP2-4.5 and SSP5-8.5.</p>', unsafe_allow_html=True)
 
     if not st.session_state.model_done:
         st.warning("Train the model (Step 5) first.")

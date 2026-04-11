@@ -27,10 +27,10 @@ except ImportError:
 
 try:
     import tensorflow as tf
-    from keras.models import Sequential
-    from keras.layers import LSTM, Dense, Dropout
-    from keras.callbacks import EarlyStopping, ReduceLROnPlateau
-    from keras.optimizers import Adam
+    from tensorflow.keras.models import Sequential
+    from tensorflow.keras.layers import LSTM, Dense, Dropout
+    from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
+    from tensorflow.keras.optimizers import Adam
     tf.get_logger().setLevel('ERROR')
     HAS_TF = True
 except ImportError:
@@ -466,13 +466,18 @@ if peak_mask.sum() > 0:
     print(f"   Peak RMSE: {peak_rmse:.2f}   Bias: {peak_bias:+.1f}%")
 
 # ===========================================================
-#  PLOT 1: Observed vs Predicted time-series (XGB Ensemble)
+#  PLOT 1: Observed vs Predicted time-series (All Models)
 # ===========================================================
+ridge_pred_real = np.expm1(ridge_pred)
+
 fig, ax = plt.subplots(figsize=(14, 5))
-ax.plot(test_dates.values, y_test_real, label='Observed', alpha=0.8, linewidth=0.9)
-ax.plot(test_dates.values, y_pred_real, label='XGB Ensemble', alpha=0.8, linewidth=0.9)
-ax.fill_between(test_dates.values, y_test_real, y_pred_real, alpha=0.1, color='red')
-ax.set_title(f"Observed vs Predicted — XGB Ensemble\nRMSE={rmse:.1f}  MAE={mae:.1f}  NSE={nse:.3f}")
+ax.plot(test_dates.values, y_test_real, label='Observed', alpha=0.8, linewidth=0.9, color='#1a1a1a')
+ax.plot(test_dates.values, ridge_pred_real, label=f'Ridge (best, NSE={ridge_metrics["nse"]:.3f})',
+        alpha=0.9, linewidth=1.3, color='#F39C12')
+ax.plot(test_dates.values, y_pred_real, label=f'XGB Ensemble (NSE={nse:.3f})',
+        alpha=0.6, linewidth=0.8, color='#2E86C1')
+ax.fill_between(test_dates.values, y_test_real, ridge_pred_real, alpha=0.08, color='#F39C12')
+ax.set_title(f"Observed vs Predicted — Ridge (best) & XGB Ensemble")
 ax.set_xlabel("Date"); ax.set_ylabel("Discharge (m³/s)"); ax.legend()
 plt.tight_layout()
 plt.savefig(MODEL_DIR / "obs_vs_pred_timeseries.png", dpi=150)
@@ -480,20 +485,58 @@ plt.close()
 print(f"\n📸 Saved: obs_vs_pred_timeseries.png")
 
 # ===========================================================
-#  PLOT 2: Scatter
+#  PLOT 2: Scatter — 3 panels (Ridge, XGB, LSTM if available)
 # ===========================================================
-fig, ax = plt.subplots(figsize=(6, 6))
+n_scatter = 2 + (1 if HAS_TF and common_dates is not None else 0)
+fig, axes = plt.subplots(1, n_scatter, figsize=(6 * n_scatter, 6))
+if n_scatter == 2:
+    axes = list(axes)
+else:
+    axes = list(axes)
+
+max_val = max(y_test_real.max(), ridge_pred_real.max(), y_pred_real.max()) * 1.05
+
+# Ridge scatter
+ax = axes[0]
+ax.scatter(y_test_real, ridge_pred_real, alpha=0.3, s=5, c='#F39C12')
+if peak_mask.sum() > 0:
+    ax.scatter(y_test_real[peak_mask], ridge_pred_real[peak_mask], alpha=0.6, s=12, c='coral', label=f'Peak (>{p90:.0f})')
+ax.plot([0, max_val], [0, max_val], 'k--', alpha=0.5, label='1:1')
+ax.set_title(f"Ridge (best)\nR²={ridge_metrics['r2']:.4f}  RMSE={ridge_metrics['rmse']:.1f}")
+ax.set_xlabel("Observed (m³/s)"); ax.set_ylabel("Predicted (m³/s)"); ax.legend(fontsize=8)
+ax.set_xlim(0, max_val); ax.set_ylim(0, max_val); ax.set_aspect('equal')
+
+# XGB Ensemble scatter
+ax = axes[1]
 ax.scatter(y_test_real, y_pred_real, alpha=0.3, s=5, c='steelblue')
 if peak_mask.sum() > 0:
-    ax.scatter(y_test_real[peak_mask], y_pred_real[peak_mask], alpha=0.6, s=12, c='coral', label=f'Peak (>{p90:.0f})')
-max_val = max(y_test_real.max(), y_pred_real.max()) * 1.05
-ax.plot([0, max_val], [0, max_val], 'k--', alpha=0.5, label='1:1')
-ax.set_title(f"Scatter — XGB Ensemble (R²={r2:.4f})")
-ax.set_xlabel("Observed (m³/s)"); ax.set_ylabel("Predicted (m³/s)"); ax.legend()
+    ax.scatter(y_test_real[peak_mask], y_pred_real[peak_mask], alpha=0.6, s=12, c='coral')
+ax.plot([0, max_val], [0, max_val], 'k--', alpha=0.5)
+ax.set_title(f"XGB Ensemble\nR²={r2:.4f}  RMSE={rmse:.1f}")
+ax.set_xlabel("Observed (m³/s)"); ax.set_ylabel("Predicted (m³/s)")
+ax.set_xlim(0, max_val); ax.set_ylim(0, max_val); ax.set_aspect('equal')
+
+plt.suptitle("Scatter Comparison", fontsize=13, y=1.02)
 plt.tight_layout()
-plt.savefig(MODEL_DIR / "scatter_obs_vs_pred.png", dpi=150)
+plt.savefig(MODEL_DIR / "scatter_obs_vs_pred.png", dpi=150, bbox_inches='tight')
 plt.close()
 print(f"📸 Saved: scatter_obs_vs_pred.png")
+
+# ===========================================================
+#  PLOT 2b: Residual Analysis — Ridge
+# ===========================================================
+ridge_residuals = y_test_real - ridge_pred_real
+fig, axes_r = plt.subplots(1, 2, figsize=(12, 4))
+axes_r[0].scatter(ridge_pred_real, ridge_residuals, alpha=0.2, s=5, c='#F39C12')
+axes_r[0].axhline(0, color='red', linewidth=0.8, linestyle='--')
+axes_r[0].set_xlabel("Predicted (m³/s)"); axes_r[0].set_ylabel("Residual"); axes_r[0].set_title("Residuals vs Predicted (Ridge)")
+axes_r[1].hist(ridge_residuals, bins=60, edgecolor='white', linewidth=0.3, color='#F39C12')
+axes_r[1].axvline(0, color='red', linewidth=0.8, linestyle='--')
+axes_r[1].set_xlabel("Residual (m³/s)"); axes_r[1].set_ylabel("Freq"); axes_r[1].set_title(f"Ridge Residuals (mean={np.mean(ridge_residuals):.1f})")
+plt.tight_layout()
+plt.savefig(MODEL_DIR / "ridge_residual_analysis.png", dpi=150)
+plt.close()
+print(f"📸 Saved: ridge_residual_analysis.png")
 
 # ===========================================================
 #  PLOT 3: Feature Importance
@@ -553,12 +596,16 @@ print(f"📸 Saved: residual_analysis.png")
 #  PLOT 6 (NEW): XGB vs LSTM time-series overlay
 # ===========================================================
 if HAS_TF and common_dates is not None and len(common_dates) > 0:
+    # Get Ridge predictions aligned to common dates
+    common_ridge = ridge_pred_real[common_idx_xgb]
+
     fig, ax = plt.subplots(figsize=(14, 5.5))
     ax.plot(common_dates, common_obs,  label='Observed', color='#1a1a1a', linewidth=1, alpha=0.85)
-    ax.plot(common_dates, common_xgb,  label=f'XGB Ensemble (NSE={ens_metrics["nse"]:.3f})', color='#2E86C1', linewidth=0.9, alpha=0.8)
-    ax.plot(common_dates, common_lstm, label=f'LSTM (NSE={lstm_metrics["nse"]:.3f})', color='#E74C3C', linewidth=0.9, alpha=0.8)
-    ax.plot(common_dates, hybrid_pred, label=f'Hybrid XGB+LSTM (NSE={hybrid_nse:.3f})', color='#27AE60', linewidth=1.1, alpha=0.85, linestyle='--')
-    ax.set_title("Model Comparison — Observed vs Predictions (Test Period)")
+    ax.plot(common_dates, common_ridge, label=f'Ridge (best, NSE={ridge_metrics["nse"]:.3f})', color='#F39C12', linewidth=1.3, alpha=0.9)
+    ax.plot(common_dates, common_xgb,  label=f'XGB Ensemble (NSE={ens_metrics["nse"]:.3f})', color='#2E86C1', linewidth=0.9, alpha=0.7)
+    ax.plot(common_dates, common_lstm, label=f'LSTM (NSE={lstm_metrics["nse"]:.3f})', color='#E74C3C', linewidth=0.9, alpha=0.7)
+    ax.plot(common_dates, hybrid_pred, label=f'Hybrid XGB+LSTM (NSE={hybrid_nse:.3f})', color='#27AE60', linewidth=0.9, alpha=0.7, linestyle='--')
+    ax.set_title("Model Comparison — All Models (Test Period)")
     ax.set_xlabel("Date"); ax.set_ylabel("Discharge (m³/s)")
     ax.legend(loc='upper right', fontsize=9)
     plt.tight_layout()
@@ -659,6 +706,7 @@ if HAS_TF and common_dates is not None and len(common_dates) > 0:
 results_df = pd.DataFrame({
     'date':      df.loc[test_mask, 'date'].values,
     'observed':  y_test_real,
+    'ridge':     np.expm1(ridge_pred),
     'xgb_ensemble': y_pred_real,
     'residual':  residuals,
 })
