@@ -1,0 +1,6 @@
+{
+  "correction_factor": 1.09711,
+  "p90_threshold_m3s": 237.98,
+  "best_model": "Ridge",
+  "best_nse": 0.8897
+}

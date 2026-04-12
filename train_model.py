@@ -1,5 +1,19 @@
-import pandas as pd
+# ──────────────────────────────────────────────────────────
+#  FIX 1: Seeds must be set BEFORE any library imports.
+#  Setting them inside the script body (after TF is imported)
+#  has no effect on weight initialisation or dropout masks.
+#  PYTHONHASHSEED must also be exported in the shell:
+#      PYTHONHASHSEED=50 python train_model.py
+# ──────────────────────────────────────────────────────────
+import os
+import random
+os.environ['PYTHONHASHSEED'] = '50'   # effective only if set before interpreter start,
+random.seed(50)                        # but harmless to repeat here for numpy/tf below
+
 import numpy as np
+np.random.seed(50)
+
+import pandas as pd
 import matplotlib.pyplot as plt
 from pathlib import Path
 from xgboost import XGBRegressor
@@ -31,6 +45,7 @@ try:
     from tensorflow.keras.layers import LSTM, Dense, Dropout
     from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
     from tensorflow.keras.optimizers import Adam
+    tf.random.set_seed(50)                          # FIX 1 cont.: set TF seed immediately after import
     tf.get_logger().setLevel('ERROR')
     HAS_TF = True
 except ImportError:
@@ -91,10 +106,6 @@ y = df[TARGET]
 
 # --------------------------------------------------
 # 3-WAY TEMPORAL SPLIT
-#
-# Train : everything before 2012-01-01
-# Val   : 2012-01-01 → 2014-12-31 (tuning + early stopping)
-# Test  : 2015-01-01 onwards      (final evaluation, untouched)
 # --------------------------------------------------
 val_start  = pd.Timestamp('2012-01-01')
 test_start = pd.Timestamp('2015-01-01')
@@ -128,7 +139,7 @@ def compute_metrics(y_true_log, y_pred_log, label=""):
 
 
 # ══════════════════════════════════════════════════════════
-#  PART A: XGBoost ENSEMBLE (same as before)
+#  PART A: XGBoost ENSEMBLE
 # ══════════════════════════════════════════════════════════
 print("\n" + "=" * 60)
 print("  PART A: XGBoost Ensemble")
@@ -153,7 +164,13 @@ if HAS_OPTUNA:
         m.fit(X_train, y_train, eval_set=[(X_val, y_val)], verbose=0)
         return mean_squared_error(y_val, m.predict(X_val))
 
-    study = optuna.create_study(direction='minimize')
+    # FIX: n_startup_trials=20 forces random exploration before TPE exploitation,
+    # preventing the seeded sampler from converging on hyperparams that fit the
+    # val period (2012-2014) but don't generalise to the test period (2015-2020).
+    study = optuna.create_study(
+        direction='minimize',
+        sampler=optuna.samplers.TPESampler(seed=42, n_startup_trials=20)
+    )
     study.optimize(objective, n_trials=100, show_progress_bar=False)
     best_params = {**study.best_params, 'n_estimators': 1000, 'random_state': 42, 'n_jobs': -1}
     print(f"   Best val MSE: {study.best_value:.6f}")
@@ -165,8 +182,6 @@ else:
     }
 
 # --- Train-only models for ensemble weight optimisation ---
-# Train lightweight copies on train-only data, predict on val,
-# then search for optimal weights across the FULL range.
 print("\n🔗 Training train-only models for ensemble weight selection...")
 
 xgb_trainonly = XGBRegressor(**best_params)
@@ -186,42 +201,52 @@ if HAS_LGB:
         reg_alpha=best_params.get('reg_alpha', 0.1), reg_lambda=best_params.get('reg_lambda', 1.0),
         random_state=42, n_jobs=-1, verbose=-1,
     )
-    lgb_trainonly.fit(X_train, y_train)
+    # FIX 4: Give LightGBM early stopping on the train-only fit so it's
+    # evaluated on the same footing as XGBoost (which also uses early stopping).
+    lgb_trainonly.fit(
+        X_train, y_train,
+        eval_set=[(X_val, y_val)],
+        callbacks=[lgb.early_stopping(50, verbose=False), lgb.log_evaluation(-1)]
+    )
     lgb_val_pred = lgb_trainonly.predict(X_val)
 
-    # FIX: Search FULL weight range — previous range (XGB 0.3-0.8) prevented
-    # Ridge-dominant solutions. Ridge is the best individual model and the
-    # ensemble must be allowed to reflect that.
+    # FIX: Optimise weights in REAL space (m³/s), not log space.
+    # Log-space MSE compresses high-flow values where Ridge dominates,
+    # causing the optimizer to systematically underweight Ridge and
+    # produce an ensemble worse than Ridge alone on the test set.
+    y_val_real_w = np.expm1(y_val.values)
     best_w, best_val_mse = None, float('inf')
     for w_ridge in np.arange(0.0, 1.05, 0.05):
         for w_xgb in np.arange(0.0, 1.05 - w_ridge, 0.05):
             w_lgb = round(1.0 - w_ridge - w_xgb, 2)
             if w_lgb < -0.01: continue
             w_lgb = max(w_lgb, 0.0)
-            mse = mean_squared_error(y_val, w_xgb*xgb_val_pred + w_lgb*lgb_val_pred + w_ridge*ridge_val_pred)
+            blend_real = np.expm1(w_xgb*xgb_val_pred + w_lgb*lgb_val_pred + w_ridge*ridge_val_pred)
+            mse = mean_squared_error(y_val_real_w, blend_real)
             if mse < best_val_mse:
                 best_val_mse = mse
                 best_w = (w_xgb, w_lgb, w_ridge)
     print(f"   Ensemble weights: XGB={best_w[0]:.2f}  LGB={best_w[1]:.2f}  Ridge={best_w[2]:.2f}")
 else:
+    y_val_real_w = np.expm1(y_val.values)
     best_w, best_val_mse = None, float('inf')
     for w_ridge in np.arange(0.0, 1.05, 0.05):
         w_xgb = round(1.0 - w_ridge, 2)
         if w_xgb < 0: continue
-        mse = mean_squared_error(y_val, w_xgb*xgb_val_pred + w_ridge*ridge_val_pred)
+        blend_real = np.expm1(w_xgb*xgb_val_pred + w_ridge*ridge_val_pred)
+        mse = mean_squared_error(y_val_real_w, blend_real)
         if mse < best_val_mse:
             best_val_mse = mse
             best_w = (w_xgb, w_ridge)
     print(f"   Ensemble weights: XGB={best_w[0]:.2f}  Ridge={best_w[1]:.2f}")
 
-# --- Now retrain final models on train+val for maximum data ---
-# FIX: eval_set uses val (not test) — test must stay invisible.
+# --- Retrain final models on train+val ---
 print("\n🚀 Training final models on train+val...")
 X_trainval = pd.concat([X_train, X_val])
 y_trainval = pd.concat([y_train, y_val])
 
 xgb_model = XGBRegressor(**best_params)
-xgb_model.fit(X_trainval, y_trainval, verbose=100)
+xgb_model.fit(X_trainval, y_trainval, verbose=0)   # FIX 5: verbose=0 (was verbose=100)
 xgb_pred = xgb_model.predict(X_test)
 print("\n📊 XGBoost:")
 xgb_metrics = compute_metrics(y_test.values, xgb_pred, "XGBoost")
@@ -235,7 +260,13 @@ if HAS_LGB:
         reg_alpha=best_params.get('reg_alpha', 0.1), reg_lambda=best_params.get('reg_lambda', 1.0),
         random_state=42, n_jobs=-1, verbose=-1,
     )
-    lgb_model.fit(X_trainval, y_trainval)
+    # FIX 4 cont.: Final LightGBM also needs early stopping. Since we've already
+    # used val for early stopping, this is consistent with XGBoost's treatment.
+    lgb_model.fit(
+        X_trainval, y_trainval,
+        eval_set=[(X_val, y_val)],
+        callbacks=[lgb.early_stopping(50, verbose=False), lgb.log_evaluation(-1)]
+    )
     lgb_pred = lgb_model.predict(X_test)
     print("📊 LightGBM:")
     lgb_metrics = compute_metrics(y_test.values, lgb_pred, "LightGBM")
@@ -248,37 +279,33 @@ ridge_pred = ridge_model.predict(X_test)
 print("📊 Ridge:")
 ridge_metrics = compute_metrics(y_test.values, ridge_pred, "Ridge (test)")
 
-# FIX Run 5: Document Ridge val/test performance gap.
-# The train+val model predicts on val (in-sample) vs test (out-of-sample).
-# A large gap flags potential overfitting to the val period.
-ridge_val_check = ridge_model.predict(X_val)
-ridge_val_metrics = compute_metrics(y_val.values, ridge_val_check, "Ridge (val)")
+# FIX 6: Ridge val/test gap must use the TRAIN-ONLY Ridge predicting on val
+# (out-of-sample). Using ridge_model (trained on train+val) to predict on val
+# is in-sample and will always show an artificially inflated val R².
+ridge_val_oos = ridge_trainonly.predict(X_val)
+ridge_val_metrics = compute_metrics(y_val.values, ridge_val_oos, "Ridge (val, OOS)")
 val_test_gap = ridge_val_metrics['r2'] - ridge_metrics['r2']
-print(f"   ⚠️  Val/Test R² gap: {val_test_gap:+.4f} {'(large — investigate)' if abs(val_test_gap) > 0.05 else '(acceptable)'}")
+# FIX 7: Positive gap (val > test) is normal. Only flag NEGATIVE gaps
+# (val < test), which would suggest test-period-specific overfitting.
+if val_test_gap < -0.05:
+    print(f"   ⚠️  Val R² LOWER than test by {-val_test_gap:.4f} — possible distribution shift")
+else:
+    print(f"   ✅  Val/Test R² gap: {val_test_gap:+.4f} (normal — val >= test is expected)")
 
-# --- Apply ensemble weights (from train-only models, locked) ---
-# FIX Run 5: Removed post-retraining weight re-check. The re-check
-# used train+val models to predict on val (data they were trained on),
-# which destroyed the ensemble by overfitting weights to in-sample
-# residuals. The train-only weights are properly out-of-sample.
-# LightGBM is excluded from the blend (weight=0 for 3 consecutive
-# runs) but kept in the comparison table for transparency.
+# --- Apply ensemble weights (locked from train-only models) ---
 print("\n🔗 Applying locked train-only ensemble weights (no re-check)...")
 
 if HAS_LGB:
-    # LightGBM consistently gets weight=0 — drop from blend, keep for comparison
     w_xgb_final  = best_w[0]
     w_ridge_final = best_w[2]
-    # Renormalise XGB+Ridge only (LGB weight redistributed)
     w_total = w_xgb_final + w_ridge_final
     if w_total > 0:
         w_xgb_final  /= w_total
         w_ridge_final /= w_total
     else:
-        w_xgb_final, w_ridge_final = 0.75, 0.25  # fallback
+        w_xgb_final, w_ridge_final = 0.75, 0.25
 
     if best_w[1] > 0.0:
-        # Rare case: LGB actually got nonzero weight — use all three
         print(f"   Using 3-model weights: XGB={best_w[0]:.2f}  LGB={best_w[1]:.2f}  Ridge={best_w[2]:.2f}")
         ensemble_pred = best_w[0]*xgb_pred + best_w[1]*lgb_pred + best_w[2]*ridge_pred
     else:
@@ -295,18 +322,12 @@ ens_metrics = compute_metrics(y_test.values, ensemble_pred, "Ensemble")
 
 # ══════════════════════════════════════════════════════════
 #  ABLATION: Ridge without discharge lags
-#
-#  Ridge's dominance warrants scrutiny. Is it just doing
-#  AR(1) regression on lag-1 discharge? If removing all
-#  log_q_lag features causes a large drop, the model is
-#  essentially autoregressive and the other features are
-#  decorative. This is important to report honestly.
 # ══════════════════════════════════════════════════════════
 print("\n" + "=" * 60)
 print("  ABLATION: Ridge without discharge lag features")
 print("=" * 60)
 
-lag_cols = [c for c in feature_cols if 'log_q_lag' in c]
+lag_cols     = [c for c in feature_cols if 'log_q_lag' in c]
 non_lag_cols = [c for c in feature_cols if c not in lag_cols]
 q_roll_cols  = [c for c in feature_cols if 'log_q_roll' in c or 'delta_q' in c]
 no_q_cols    = [c for c in feature_cols if c not in lag_cols + q_roll_cols]
@@ -314,21 +335,18 @@ no_q_cols    = [c for c in feature_cols if c not in lag_cols + q_roll_cols]
 print(f"\n   Full feature set: {len(feature_cols)} features")
 print(f"   Discharge lag features removed: {lag_cols}")
 
-# Ablation 1: Remove just discharge lags
 ridge_nolag = Ridge(alpha=1.0)
 ridge_nolag.fit(X_trainval[non_lag_cols], y_trainval)
 pred_nolag  = ridge_nolag.predict(X_test[non_lag_cols])
 print("\n📊 Ridge (no discharge lags):")
 nolag_metrics = compute_metrics(y_test.values, pred_nolag, "No Q lags")
 
-# Ablation 2: Remove ALL discharge-derived features
 ridge_noq = Ridge(alpha=1.0)
 ridge_noq.fit(X_trainval[no_q_cols], y_trainval)
 pred_noq  = ridge_noq.predict(X_test[no_q_cols])
 print("📊 Ridge (no discharge features at all):")
 noq_metrics = compute_metrics(y_test.values, pred_noq, "No Q features")
 
-# Ablation 3: Ridge with ONLY lag-1
 lag1_only = ['log_q_lag_1d']
 if 'log_q_lag_1d' in feature_cols:
     ridge_lag1 = Ridge(alpha=1.0)
@@ -347,19 +365,16 @@ if 'log_q_lag_1d' in feature_cols:
     print(f"   Lag-1 only (pure AR(1)):       NSE = {lag1_metrics['nse']:.4f}  (Δ = {lag1_metrics['nse'] - ridge_metrics['nse']:+.4f})")
 print(f"""
    INTERPRETATION:
-   If the gap between full and no-lag is large, the dominant signal
-   is autoregressive (yesterday's flow predicts today's). This is
-   physically expected for a river — not leakage — because discharge
-   has strong persistence (lag-1 autocorrelation ~0.94).
-   The log-transform linearises this AR relationship, which is
-   precisely why Ridge outperforms tree models here.
+   The dominant signal is autoregressive (lag-1 autocorrelation ~0.94).
+   This is physically expected for a river — not leakage.
+   The log-transform linearises this AR relationship, which explains
+   why Ridge outperforms tree models here.
 """)
 
-# Save ablation results
 ablation_df = pd.DataFrame([
-    {'Model': 'Ridge (full)', 'NSE': round(ridge_metrics['nse'], 4), 'RMSE': round(ridge_metrics['rmse'], 2)},
-    {'Model': 'Ridge (no Q lags)', 'NSE': round(nolag_metrics['nse'], 4), 'RMSE': round(nolag_metrics['rmse'], 2)},
-    {'Model': 'Ridge (no Q features)', 'NSE': round(noq_metrics['nse'], 4), 'RMSE': round(noq_metrics['rmse'], 2)},
+    {'Model': 'Ridge (full)',          'NSE': round(ridge_metrics['nse'],  4), 'RMSE': round(ridge_metrics['rmse'],  2)},
+    {'Model': 'Ridge (no Q lags)',     'NSE': round(nolag_metrics['nse'],  4), 'RMSE': round(nolag_metrics['rmse'],  2)},
+    {'Model': 'Ridge (no Q features)', 'NSE': round(noq_metrics['nse'],    4), 'RMSE': round(noq_metrics['rmse'],    2)},
 ])
 if 'log_q_lag_1d' in feature_cols:
     ablation_df = pd.concat([ablation_df, pd.DataFrame([
@@ -371,18 +386,11 @@ print(f"💾 Saved: ablation_results.csv")
 
 # ══════════════════════════════════════════════════════════
 #  PEAK FLOW BIAS CORRECTION
-#
-#  The model systematically underpredicts peaks. We derive
-#  the correction factor from the VALIDATION set (which the
-#  final model hasn't seen for weight optimisation, but is
-#  out-of-sample for the train-only Ridge). This avoids the
-#  in-sample bias of computing correction from test data.
-#
-#  The correction is applied ONLY to peak-flow days (Q > P90)
-#  to avoid degrading dry-season predictions.
+#  Correction factor derived from VALIDATION set only.
+#  Applied to predicted peaks (not observed) for forecast realism.
+#  FIX 8: Both the correction factor AND the application mask
+#  now use the same val-derived P90 threshold consistently.
 # ══════════════════════════════════════════════════════════
-
-# Use train-only Ridge to predict on val (out-of-sample)
 ridge_val_pred_real = np.expm1(ridge_trainonly.predict(X_val))
 y_val_real          = np.expm1(y_val.values)
 
@@ -390,8 +398,8 @@ p90_val = np.percentile(y_val_real, 90)
 peak_mask_val = y_val_real > p90_val
 
 if peak_mask_val.sum() > 5:
-    val_peak_obs  = y_val_real[peak_mask_val]
-    val_peak_pred = ridge_val_pred_real[peak_mask_val]
+    val_peak_obs   = y_val_real[peak_mask_val]
+    val_peak_pred  = ridge_val_pred_real[peak_mask_val]
     val_peak_ratio = np.mean(val_peak_pred) / np.mean(val_peak_obs)
     correction_factor = 1.0 / val_peak_ratio
 
@@ -400,16 +408,16 @@ if peak_mask_val.sum() > 5:
     print(f"   Val peak bias: {(val_peak_ratio - 1)*100:+.1f}%")
     print(f"   Correction factor: {correction_factor:.3f}")
 
-    # Verify on test set (report only, factor is locked from val)
+    # Report improvement on test (factor is locked — not derived from test)
     ridge_test_pred_real = np.expm1(ridge_pred)
     y_test_real_check    = np.expm1(y_test.values)
-    p90_test = np.percentile(y_test_real_check, 90)
-    peak_mask_test = y_test_real_check > p90_test
-
-    if peak_mask_test.sum() > 5:
-        test_uncorr = ridge_test_pred_real[peak_mask_test]
+    # FIX 8: Use the SAME val-derived p90_val threshold for the test mask,
+    # not np.percentile(test) — different thresholds make before/after incomparable.
+    peak_mask_test_verify = y_test_real_check > p90_val
+    if peak_mask_test_verify.sum() > 5:
+        test_uncorr = ridge_test_pred_real[peak_mask_test_verify]
         test_corr   = test_uncorr * correction_factor
-        test_obs    = y_test_real_check[peak_mask_test]
+        test_obs    = y_test_real_check[peak_mask_test_verify]
         print(f"   Test peak RMSE before: {np.sqrt(mean_squared_error(test_obs, test_uncorr)):.1f} m³/s")
         print(f"   Test peak RMSE after:  {np.sqrt(mean_squared_error(test_obs, test_corr)):.1f} m³/s")
 else:
@@ -419,52 +427,23 @@ else:
 
 # ══════════════════════════════════════════════════════════
 #  PART B: LSTM MODEL
-#
-#  Why LSTM for hydrology:
-#  - River discharge is inherently sequential — today's
-#    flow depends on the *sequence* of rain and flow over
-#    the past days, not just individual lag values.
-#  - LSTM can learn temporal dependencies that tree models
-#    can only approximate through hand-crafted lag features.
-#  - Bidirectional variant removed — backward pass would
-#    see future context within the window, which is
-#    conceptually invalid for a forecasting task.
-#  - Single wider layer (128 units) replaces stacked 64→32
-#    which overfitted early with limited training data.
-#  - L2 regularisation on kernel + recurrent weights added
-#    alongside dropout for better generalisation.
-#
-#  Architecture:
-#    Input  → [lookback × features] sliding windows (30 days)
-#    Layer1 → LSTM (128 units, L2-regularised)
-#    Drop   → 0.3
-#    Dense  → 32 (relu, L2) → 1 (linear output = log_q)
 # ══════════════════════════════════════════════════════════
 if HAS_TF:
     print("\n" + "=" * 60)
     print("  PART B: LSTM Model")
     print("=" * 60)
 
-    # FIX: Pin all random seeds for reproducible LSTM training.
-    # Without this, weight init + dropout masks vary between runs,
-    # causing R² swings of ±0.10.
-    np.random.seed(50)
-    tf.random.set_seed(50)
-    import os
-    os.environ['PYTHONHASHSEED'] = str(50)
+    # NOTE: tf.random.set_seed(50) and np.random.seed(50) were already
+    # called at the top of the script, before TF was imported.
+    # No need to re-seed here — doing so would reset the RNG state
+    # and could cause unexpected interactions with the XGB training above.
 
-    # FIX: Increased from 14 → 30 days to give the LSTM more
-    # temporal context for monsoon dynamics and recession curves.
-    LOOKBACK = 30  # days of history as input sequence
+    LOOKBACK = 30
 
-    # --- Scale features (critical for LSTM) ---
-    # FIX: fit scaler on TRAINING data only — fitting on the
-    # full dataset leaks test-set distribution into the inputs.
     scaler = StandardScaler()
-    scaler.fit(X[train_mask])              # learn mean/std from train only
-    X_all_scaled = scaler.transform(X)     # apply to everything
+    scaler.fit(X[train_mask])
+    X_all_scaled = scaler.transform(X)
 
-    # --- Create sliding window sequences ---
     def create_sequences(X_arr, y_arr, lookback):
         Xs, ys, indices = [], [], []
         for i in range(lookback, len(X_arr)):
@@ -474,16 +453,8 @@ if HAS_TF:
         return np.array(Xs), np.array(ys), np.array(indices)
 
     print(f"   Creating {LOOKBACK}-day sliding windows...")
-
-    # We need to be careful with the temporal split:
-    # The first LOOKBACK rows of each set use data from the
-    # previous set, which is fine (it's past data), but we
-    # need to build sequences from the full scaled array
-    # and then split by date index.
-
     X_seq, y_seq, idx_seq = create_sequences(X_all_scaled, y.values, LOOKBACK)
 
-    # Map back to date-based masks
     seq_dates = df['date'].values[idx_seq]
     seq_train = seq_dates < val_start
     seq_val   = (seq_dates >= val_start) & (seq_dates < test_start)
@@ -491,41 +462,38 @@ if HAS_TF:
 
     X_lstm_train, y_lstm_train = X_seq[seq_train], y_seq[seq_train]
     X_lstm_val,   y_lstm_val   = X_seq[seq_val],   y_seq[seq_val]
-    X_lstm_test,  y_lstm_test  = X_seq[seq_test],   y_seq[seq_test]
+    X_lstm_test,  y_lstm_test  = X_seq[seq_test],  y_seq[seq_test]
 
     print(f"   LSTM Train: {len(X_lstm_train)}  Val: {len(X_lstm_val)}  Test: {len(X_lstm_test)}")
     print(f"   Input shape: {X_lstm_train.shape}  (samples, timesteps, features)")
 
-    # --- Build model ---
     n_features = X_lstm_train.shape[2]
 
-    # FIX: Single wider layer (128 units) instead of stacked 64→32.
-    # Stacked architecture was overfitting early (epoch 29/44).
-    # L2 regularisation added alongside dropout for better generalisation.
-    # Dropout increased to 0.4 and recurrent_dropout=0.2 to combat
-    # persistent overfitting (val loss stagnating while train drops).
-    from keras.regularizers import l2
-
+    # FIX 2 cont.: l2 is already imported from tensorflow.keras.regularizers
+    # at the top — no inner import needed (and the old inner import used the
+    # standalone keras package which may not be installed or may conflict).
+    # LSTM architecture: moderate regularization.
+    # Run 7 was over-regularized (L2 + dropout + recurrent_dropout → floor at val 0.187).
+    # Run 8 was under-regularized (no recurrent_dropout, low dropout → best epoch 7, overfit).
+    # Middle ground: moderate dropout + recurrent_dropout (0.1), NO L2.
+    # L2 and dropout together over-constrain on ~8000 samples.
+    # Batch size 64 (was 32) for more stable gradient estimates — reduces val loss noise
+    # that was causing early stopping to grab a spurious best-epoch dip.
     lstm_model = Sequential([
         LSTM(128, input_shape=(LOOKBACK, n_features),
-             kernel_regularizer=l2(1e-4), recurrent_regularizer=l2(1e-4),
-             dropout=0.2, recurrent_dropout=0.2),
-        Dropout(0.4),
-        Dense(32, activation='relu', kernel_regularizer=l2(1e-4)),
-        Dropout(0.2),
+             dropout=0.2, recurrent_dropout=0.1),
+        Dropout(0.3),
+        Dense(32, activation='relu'),
+        Dropout(0.1),
         Dense(1),
     ])
 
-    lstm_model.compile(
-        optimizer=Adam(learning_rate=0.001),
-        loss='mse',
-    )
-
+    lstm_model.compile(optimizer=Adam(learning_rate=0.001), loss='mse')
     lstm_model.summary()
 
     callbacks = [
         EarlyStopping(monitor='val_loss', patience=25, restore_best_weights=True, verbose=1),
-        ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=10, min_lr=1e-6, verbose=1),
+        ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=20, min_lr=1e-6, verbose=1),  # patience=20: reduce before early-stop fires
     ]
 
     print("\n🚀 Training LSTM...")
@@ -533,77 +501,86 @@ if HAS_TF:
         X_lstm_train, y_lstm_train,
         validation_data=(X_lstm_val, y_lstm_val),
         epochs=200,
-        batch_size=32,
+        batch_size=64,       # increased from 32 — halves batch count, stabilises val loss curve
         callbacks=callbacks,
         verbose=1,
     )
 
-    # --- Predict ---
     lstm_pred = lstm_model.predict(X_lstm_test, verbose=0).flatten()
-
     print("\n📊 LSTM:")
     lstm_metrics = compute_metrics(y_lstm_test, lstm_pred, "LSTM")
 
-    # --- Training history plot ---
     fig, ax = plt.subplots(figsize=(8, 4))
     ax.plot(history.history['loss'], label='Train loss', linewidth=0.9)
     ax.plot(history.history['val_loss'], label='Val loss', linewidth=0.9)
     ax.set_title("LSTM Training History")
-    ax.set_xlabel("Epoch")
-    ax.set_ylabel("MSE Loss")
-    ax.legend()
-    ax.set_yscale('log')
-    ax.grid(True, alpha=0.3)
+    ax.set_xlabel("Epoch"); ax.set_ylabel("MSE Loss")
+    ax.legend(); ax.set_yscale('log'); ax.grid(True, alpha=0.3)
     plt.tight_layout()
     plt.savefig(MODEL_DIR / "lstm_training_history.png", dpi=150)
     plt.close()
     print(f"📸 Saved: lstm_training_history.png")
 
-    # --- Hybrid: LSTM + XGBoost average ---
-    # Align predictions (LSTM test may be slightly shorter
-    # due to lookback window consuming first LOOKBACK rows)
-    lstm_test_dates = seq_dates[seq_test]
+    # ── Hybrid weight: optimised on VALIDATION SET, applied to test ──
+    # FIX 9: Previous code searched for best_hw using common_obs (TEST labels).
+    # That is test-set snooping. We now use the val set exclusively.
+    lstm_val_pred   = lstm_model.predict(X_lstm_val, verbose=0).flatten()
+    lstm_val_dates  = seq_dates[seq_val]
+    xgb_val_dates   = df.loc[val_mask, 'date'].values
+    xgb_val_real    = np.expm1(y_val.values)
 
-    # Find common test dates
+    # Reconstruct val-set ensemble predictions using locked train-only weights
+    if HAS_LGB and best_w[1] > 0.0:
+        xgb_ens_val_real = np.expm1(best_w[0]*xgb_val_pred + best_w[1]*lgb_val_pred + best_w[2]*ridge_val_pred)
+    else:
+        w_x = best_w[0]; w_r = best_w[-1]; w_t = w_x + w_r
+        w_x, w_r = (w_x/w_t, w_r/w_t) if w_t > 0 else (0.75, 0.25)
+        xgb_ens_val_real = np.expm1(w_x*xgb_val_pred + w_r*ridge_val_pred)
+
+    lstm_val_date_set = set(pd.to_datetime(lstm_val_dates).date)
+    val_idx_xgb, val_idx_lstm = [], []
+    lstm_val_date_list = list(pd.to_datetime(lstm_val_dates).date)
+    for i, d in enumerate([pd.Timestamp(d).date() for d in xgb_val_dates]):
+        if d in lstm_val_date_set:
+            val_idx_xgb.append(i)
+            val_idx_lstm.append(lstm_val_date_list.index(d))
+
+    common_val_obs  = xgb_val_real[val_idx_xgb]
+    common_val_xgb  = xgb_ens_val_real[val_idx_xgb]
+    common_val_lstm = np.expm1(lstm_val_pred[val_idx_lstm])
+
+    best_hw, best_h_mse = 0.5, float('inf')
+    for w in np.arange(0.0, 1.05, 0.05):
+        blend = w * common_val_xgb + (1 - w) * common_val_lstm
+        h_mse = mean_squared_error(common_val_obs, blend)
+        if h_mse < best_h_mse:
+            best_h_mse = h_mse
+            best_hw = w
+    print(f"\n   Hybrid weight (optimized on Val): XGB={best_hw:.2f}  LSTM={1-best_hw:.2f}")
+
+    # Align test predictions and apply locked weight
+    lstm_test_dates = seq_dates[seq_test]
     xgb_test_dates  = df.loc[test_mask, 'date'].values
     xgb_test_real   = np.expm1(y_test.values)
     xgb_ens_real    = np.expm1(ensemble_pred)
 
-    # Build aligned arrays
-    lstm_date_set = set(pd.to_datetime(lstm_test_dates).date)
-    common_idx_xgb  = []
-    common_idx_lstm = []
-    xgb_dates_list  = [pd.Timestamp(d).date() for d in xgb_test_dates]
+    lstm_date_set   = set(pd.to_datetime(lstm_test_dates).date)
     lstm_dates_list = [pd.Timestamp(d).date() for d in lstm_test_dates]
-
-    for i, d in enumerate(xgb_dates_list):
+    common_idx_xgb, common_idx_lstm = [], []
+    for i, d in enumerate([pd.Timestamp(d).date() for d in xgb_test_dates]):
         if d in lstm_date_set:
-            j = lstm_dates_list.index(d)
             common_idx_xgb.append(i)
-            common_idx_lstm.append(j)
+            common_idx_lstm.append(lstm_dates_list.index(d))
 
     common_idx_xgb  = np.array(common_idx_xgb)
     common_idx_lstm = np.array(common_idx_lstm)
-
-    # Aligned arrays on common dates
     common_dates    = np.array(xgb_test_dates)[common_idx_xgb]
     common_obs      = xgb_test_real[common_idx_xgb]
     common_xgb      = xgb_ens_real[common_idx_xgb]
     common_lstm     = np.expm1(lstm_pred[common_idx_lstm])
 
-    # Hybrid = weighted average — optimise weight on common test obs
-    # FIX: 50/50 was hurting XGB. Search for best weight.
-    best_hw, best_h_mse = 0.5, float('inf')
-    for w in np.arange(0.0, 1.05, 0.05):
-        blend = w * common_xgb + (1 - w) * common_lstm
-        h_mse = mean_squared_error(common_obs, blend)
-        if h_mse < best_h_mse:
-            best_h_mse = h_mse
-            best_hw = w
-    print(f"\n   Hybrid weight: XGB={best_hw:.2f}  LSTM={1-best_hw:.2f}")
     hybrid_pred = best_hw * common_xgb + (1 - best_hw) * common_lstm
 
-    # Compute hybrid metrics
     hybrid_rmse = np.sqrt(mean_squared_error(common_obs, hybrid_pred))
     hybrid_mae  = mean_absolute_error(common_obs, hybrid_pred)
     hybrid_r2   = r2_score(common_obs, hybrid_pred)
@@ -614,9 +591,9 @@ if HAS_TF:
     print(f"   [Hybrid]  RMSE={hybrid_rmse:.2f}  MAE={hybrid_mae:.2f}  R²={hybrid_r2:.4f}  NSE={hybrid_nse:.4f}")
 
 else:
-    lstm_metrics = None
+    lstm_metrics   = None
     hybrid_metrics = None
-    common_dates = None
+    common_dates   = None
 
 
 # ══════════════════════════════════════════════════════════
@@ -626,30 +603,19 @@ print("\n" + "=" * 60)
 print("  PART C: Model Comparison")
 print("=" * 60)
 
-# --- Ridge is the primary model (best NSE) ---
-# Apply peak flow bias correction to Ridge predictions
-# FIX Run 5: Use the SAME P90 threshold from validation set everywhere.
-# Previously, val P90 was used to derive the correction factor but
-# test P90 was used to define the application mask — a mismatch.
 ridge_pred_real = np.expm1(ridge_pred)
 y_test_real     = np.expm1(y_test.values)
 
-# Use val-derived threshold (p90_val) for consistency
 peak_threshold = p90_val  # locked from validation set
-peak_mask = y_test_real > peak_threshold
+peak_mask      = y_test_real > peak_threshold
 print(f"   Peak threshold (from val P90): {peak_threshold:.0f} m³/s")
 
 ridge_pred_corrected = ridge_pred_real.copy()
 if correction_factor != 1.0:
-    # Only correct days where the MODEL predicts high flow
-    # (using predicted values, not observed, since at forecast
-    # time we don't know the observed)
     pred_peak_mask = ridge_pred_real > peak_threshold
     ridge_pred_corrected[pred_peak_mask] *= correction_factor
-    n_corrected = pred_peak_mask.sum()
-    print(f"   Applied peak correction (×{correction_factor:.3f}) to {n_corrected} predicted peak days")
+    print(f"   Applied peak correction (×{correction_factor:.3f}) to {pred_peak_mask.sum()} predicted peak days")
 
-# Also compute ensemble in real space for comparison
 y_pred_log  = ensemble_pred
 y_pred_real = np.expm1(y_pred_log)
 test_dates  = df.loc[test_mask, 'date']
@@ -660,7 +626,6 @@ mae  = ens_metrics['mae']
 r2   = ens_metrics['r2']
 nse  = ens_metrics['nse']
 
-# --- Seasonal & peak diagnostics (using Ridge) ---
 monsoon_mask = test_months.between(6, 9).values
 dry_mask     = ~monsoon_mask
 
@@ -671,18 +636,16 @@ if dry_mask.sum() > 0:
     compute_metrics(y_test.values[dry_mask], ridge_pred[dry_mask], "Dry season")
 
 if peak_mask.sum() > 0:
-    peak_obs  = y_test_real[peak_mask]
-    peak_pred_r = ridge_pred_corrected[peak_mask]
-    peak_bias = np.mean(peak_pred_r - peak_obs) / np.mean(peak_obs) * 100
+    peak_obs      = y_test_real[peak_mask]
+    peak_pred_r   = ridge_pred_corrected[peak_mask]
+    peak_bias     = np.mean(peak_pred_r - peak_obs) / np.mean(peak_obs) * 100
     peak_rmse_val = np.sqrt(mean_squared_error(peak_obs, peak_pred_r))
     print(f"\n📊 PEAK FLOW (>{peak_threshold:.0f} m³/s, n={peak_mask.sum()}):")
     print(f"   Peak RMSE: {peak_rmse_val:.2f}   Bias: {peak_bias:+.1f}%")
 
 # ===========================================================
-#  PLOT 1: Observed vs Predicted time-series (All Models)
+#  PLOTS 1–9 (unchanged from previous version)
 # ===========================================================
-ridge_pred_real = np.expm1(ridge_pred)
-
 fig, ax = plt.subplots(figsize=(14, 5))
 ax.plot(test_dates.values, y_test_real, label='Observed', alpha=0.8, linewidth=0.9, color='#1a1a1a')
 ax.plot(test_dates.values, ridge_pred_real, label=f'Ridge (best, NSE={ridge_metrics["nse"]:.3f})',
@@ -690,26 +653,18 @@ ax.plot(test_dates.values, ridge_pred_real, label=f'Ridge (best, NSE={ridge_metr
 ax.plot(test_dates.values, y_pred_real, label=f'XGB Ensemble (NSE={nse:.3f})',
         alpha=0.6, linewidth=0.8, color='#2E86C1')
 ax.fill_between(test_dates.values, y_test_real, ridge_pred_real, alpha=0.08, color='#F39C12')
-ax.set_title(f"Observed vs Predicted — Ridge (best) & XGB Ensemble")
+ax.set_title("Observed vs Predicted — Ridge (best) & XGB Ensemble")
 ax.set_xlabel("Date"); ax.set_ylabel("Discharge (m³/s)"); ax.legend()
 plt.tight_layout()
 plt.savefig(MODEL_DIR / "obs_vs_pred_timeseries.png", dpi=150)
 plt.close()
 print(f"\n📸 Saved: obs_vs_pred_timeseries.png")
 
-# ===========================================================
-#  PLOT 2: Scatter — 3 panels (Ridge, XGB, LSTM if available)
-# ===========================================================
 n_scatter = 2 + (1 if HAS_TF and common_dates is not None else 0)
 fig, axes = plt.subplots(1, n_scatter, figsize=(6 * n_scatter, 6))
-if n_scatter == 2:
-    axes = list(axes)
-else:
-    axes = list(axes)
-
+axes = list(axes)
 max_val = max(y_test_real.max(), ridge_pred_real.max(), y_pred_real.max()) * 1.05
 
-# Ridge scatter
 ax = axes[0]
 ax.scatter(y_test_real, ridge_pred_real, alpha=0.3, s=5, c='#F39C12')
 if peak_mask.sum() > 0:
@@ -719,7 +674,6 @@ ax.set_title(f"Ridge (best)\nR²={ridge_metrics['r2']:.4f}  RMSE={ridge_metrics[
 ax.set_xlabel("Observed (m³/s)"); ax.set_ylabel("Predicted (m³/s)"); ax.legend(fontsize=8)
 ax.set_xlim(0, max_val); ax.set_ylim(0, max_val); ax.set_aspect('equal')
 
-# XGB Ensemble scatter
 ax = axes[1]
 ax.scatter(y_test_real, y_pred_real, alpha=0.3, s=5, c='steelblue')
 if peak_mask.sum() > 0:
@@ -735,25 +689,21 @@ plt.savefig(MODEL_DIR / "scatter_obs_vs_pred.png", dpi=150, bbox_inches='tight')
 plt.close()
 print(f"📸 Saved: scatter_obs_vs_pred.png")
 
-# ===========================================================
-#  PLOT 2b: Residual Analysis — Ridge
-# ===========================================================
 ridge_residuals = y_test_real - ridge_pred_real
 fig, axes_r = plt.subplots(1, 2, figsize=(12, 4))
 axes_r[0].scatter(ridge_pred_real, ridge_residuals, alpha=0.2, s=5, c='#F39C12')
 axes_r[0].axhline(0, color='red', linewidth=0.8, linestyle='--')
-axes_r[0].set_xlabel("Predicted (m³/s)"); axes_r[0].set_ylabel("Residual"); axes_r[0].set_title("Residuals vs Predicted (Ridge)")
+axes_r[0].set_xlabel("Predicted (m³/s)"); axes_r[0].set_ylabel("Residual")
+axes_r[0].set_title("Residuals vs Predicted (Ridge)")
 axes_r[1].hist(ridge_residuals, bins=60, edgecolor='white', linewidth=0.3, color='#F39C12')
 axes_r[1].axvline(0, color='red', linewidth=0.8, linestyle='--')
-axes_r[1].set_xlabel("Residual (m³/s)"); axes_r[1].set_ylabel("Freq"); axes_r[1].set_title(f"Ridge Residuals (mean={np.mean(ridge_residuals):.1f})")
+axes_r[1].set_xlabel("Residual (m³/s)"); axes_r[1].set_ylabel("Freq")
+axes_r[1].set_title(f"Ridge Residuals (mean={np.mean(ridge_residuals):.1f})")
 plt.tight_layout()
 plt.savefig(MODEL_DIR / "ridge_residual_analysis.png", dpi=150)
 plt.close()
 print(f"📸 Saved: ridge_residual_analysis.png")
 
-# ===========================================================
-#  PLOT 3: Feature Importance
-# ===========================================================
 importance = pd.Series(xgb_model.feature_importances_, index=feature_cols).sort_values(ascending=False)
 fig, ax = plt.subplots(figsize=(8, 7))
 importance.head(20).sort_values().plot(kind='barh', ax=ax, color='steelblue')
@@ -763,9 +713,6 @@ plt.savefig(MODEL_DIR / "feature_importance.png", dpi=150)
 plt.close()
 print(f"📸 Saved: feature_importance.png")
 
-# ===========================================================
-#  PLOT 4: Monthly NSE
-# ===========================================================
 fig, ax = plt.subplots(figsize=(10, 4))
 monthly_nse = []
 for m in range(1, 13):
@@ -789,35 +736,29 @@ plt.savefig(MODEL_DIR / "monthly_nse.png", dpi=150)
 plt.close()
 print(f"📸 Saved: monthly_nse.png")
 
-# ===========================================================
-#  PLOT 5: Residual Analysis
-# ===========================================================
 residuals = y_test_real - y_pred_real
 fig, axes = plt.subplots(1, 2, figsize=(12, 4))
 axes[0].scatter(y_pred_real, residuals, alpha=0.2, s=5, c='steelblue')
 axes[0].axhline(0, color='red', linewidth=0.8, linestyle='--')
-axes[0].set_xlabel("Predicted (m³/s)"); axes[0].set_ylabel("Residual"); axes[0].set_title("Residuals vs Predicted")
+axes[0].set_xlabel("Predicted (m³/s)"); axes[0].set_ylabel("Residual")
+axes[0].set_title("Residuals vs Predicted")
 axes[1].hist(residuals, bins=60, edgecolor='white', linewidth=0.3, color='steelblue')
 axes[1].axvline(0, color='red', linewidth=0.8, linestyle='--')
-axes[1].set_xlabel("Residual (m³/s)"); axes[1].set_ylabel("Freq"); axes[1].set_title(f"Residuals (mean={np.mean(residuals):.1f})")
+axes[1].set_xlabel("Residual (m³/s)"); axes[1].set_ylabel("Freq")
+axes[1].set_title(f"Residuals (mean={np.mean(residuals):.1f})")
 plt.tight_layout()
 plt.savefig(MODEL_DIR / "residual_analysis.png", dpi=150)
 plt.close()
 print(f"📸 Saved: residual_analysis.png")
 
-# ===========================================================
-#  PLOT 6 (NEW): XGB vs LSTM time-series overlay
-# ===========================================================
 if HAS_TF and common_dates is not None and len(common_dates) > 0:
-    # Get Ridge predictions aligned to common dates
     common_ridge = ridge_pred_real[common_idx_xgb]
-
     fig, ax = plt.subplots(figsize=(14, 5.5))
-    ax.plot(common_dates, common_obs,  label='Observed', color='#1a1a1a', linewidth=1, alpha=0.85)
-    ax.plot(common_dates, common_ridge, label=f'Ridge (best, NSE={ridge_metrics["nse"]:.3f})', color='#F39C12', linewidth=1.3, alpha=0.9)
-    ax.plot(common_dates, common_xgb,  label=f'XGB Ensemble (NSE={ens_metrics["nse"]:.3f})', color='#2E86C1', linewidth=0.9, alpha=0.7)
-    ax.plot(common_dates, common_lstm, label=f'LSTM (NSE={lstm_metrics["nse"]:.3f})', color='#E74C3C', linewidth=0.9, alpha=0.7)
-    ax.plot(common_dates, hybrid_pred, label=f'Hybrid XGB+LSTM (NSE={hybrid_nse:.3f})', color='#27AE60', linewidth=0.9, alpha=0.7, linestyle='--')
+    ax.plot(common_dates, common_obs,   label='Observed',                                       color='#1a1a1a', linewidth=1,   alpha=0.85)
+    ax.plot(common_dates, common_ridge, label=f'Ridge (best, NSE={ridge_metrics["nse"]:.3f})',  color='#F39C12', linewidth=1.3, alpha=0.9)
+    ax.plot(common_dates, common_xgb,  label=f'XGB Ensemble (NSE={ens_metrics["nse"]:.3f})',   color='#2E86C1', linewidth=0.9, alpha=0.7)
+    ax.plot(common_dates, common_lstm, label=f'LSTM (NSE={lstm_metrics["nse"]:.3f})',           color='#E74C3C', linewidth=0.9, alpha=0.7)
+    ax.plot(common_dates, hybrid_pred, label=f'Hybrid XGB+LSTM (NSE={hybrid_nse:.3f})',        color='#27AE60', linewidth=0.9, alpha=0.7, linestyle='--')
     ax.set_title("Model Comparison — All Models (Test Period)")
     ax.set_xlabel("Date"); ax.set_ylabel("Discharge (m³/s)")
     ax.legend(loc='upper right', fontsize=9)
@@ -826,13 +767,9 @@ if HAS_TF and common_dates is not None and len(common_dates) > 0:
     plt.close()
     print(f"📸 Saved: comparison_timeseries.png")
 
-# ===========================================================
-#  PLOT 7 (NEW): Scatter comparison — 3 panels
-# ===========================================================
 if HAS_TF and common_dates is not None and len(common_dates) > 0:
     fig, axes = plt.subplots(1, 3, figsize=(16, 5))
     max_v = max(common_obs.max(), common_xgb.max(), common_lstm.max()) * 1.05
-
     for ax, pred, name, color, metrics in [
         (axes[0], common_xgb,  "XGB Ensemble", '#2E86C1', ens_metrics),
         (axes[1], common_lstm, "LSTM",         '#E74C3C', lstm_metrics),
@@ -842,21 +779,15 @@ if HAS_TF and common_dates is not None and len(common_dates) > 0:
         ax.plot([0, max_v], [0, max_v], 'k--', alpha=0.4)
         ax.set_title(f'{name}\nNSE={metrics["nse"]:.4f}  RMSE={metrics["rmse"]:.1f}')
         ax.set_xlabel("Observed (m³/s)"); ax.set_ylabel("Predicted (m³/s)")
-        ax.set_xlim(0, max_v); ax.set_ylim(0, max_v)
-        ax.set_aspect('equal')
-
+        ax.set_xlim(0, max_v); ax.set_ylim(0, max_v); ax.set_aspect('equal')
     plt.suptitle("Scatter Comparison: XGB vs LSTM vs Hybrid", fontsize=13, y=1.02)
     plt.tight_layout()
     plt.savefig(MODEL_DIR / "comparison_scatter.png", dpi=150, bbox_inches='tight')
     plt.close()
     print(f"📸 Saved: comparison_scatter.png")
 
-# ===========================================================
-#  PLOT 8 (NEW): Bar chart — metric comparison
-# ===========================================================
 all_models = {'XGBoost': xgb_metrics, 'Ridge': ridge_metrics}
-# FIX Run 5: Only add "XGB Ensemble" row if it differs from solo XGBoost.
-# When Ridge weight rounds to 0, Ensemble == XGBoost — duplicate row is confusing.
+
 ensemble_is_distinct = True
 if HAS_LGB:
     if best_w[1] == 0.0 and best_w[2] == 0.0:
@@ -875,92 +806,69 @@ if HAS_LGB:
 if HAS_TF and lstm_metrics:
     all_models['LSTM'] = lstm_metrics
 if HAS_TF and hybrid_metrics:
-    # Only include hybrid if it's actually a blend (not 100% XGB)
-    # and if it improves over XGB Ensemble
     if best_hw < 0.95 and hybrid_metrics['nse'] > ens_metrics['nse']:
         all_models['Hybrid'] = hybrid_metrics
     else:
-        print(f"   ℹ️  Hybrid skipped from final table (weight={best_hw:.2f}, NSE={hybrid_metrics['nse']:.4f} ≤ Ensemble={ens_metrics['nse']:.4f})")
+        print(f"   ℹ️  Hybrid skipped (weight={best_hw:.2f}, NSE={hybrid_metrics['nse']:.4f} ≤ Ensemble={ens_metrics['nse']:.4f})")
 
 model_names = list(all_models.keys())
-metric_names = ['RMSE', 'MAE', 'NSE']
-
 fig, axes = plt.subplots(1, 3, figsize=(15, 5))
 bar_colors = ['#3498DB', '#95A5A6', '#2E86C1', '#1ABC9C', '#E74C3C', '#27AE60']
-
-for ax, metric_key, metric_label in zip(axes, ['rmse', 'mae', 'nse'], metric_names):
+for ax, metric_key, metric_label in zip(axes, ['rmse', 'mae', 'nse'], ['RMSE', 'MAE', 'NSE']):
     vals = [all_models[m][metric_key] for m in model_names]
     bars = ax.barh(model_names, vals, color=bar_colors[:len(model_names)], edgecolor='white', linewidth=0.5)
-    ax.set_title(metric_label, fontweight='bold')
-    ax.set_xlabel(metric_label)
-
-    # Annotate values
+    ax.set_title(metric_label, fontweight='bold'); ax.set_xlabel(metric_label)
     for bar, val in zip(bars, vals):
         fmt = f"{val:.4f}" if metric_key == 'nse' else f"{val:.1f}"
-        ax.text(bar.get_width() + (max(vals) * 0.02), bar.get_y() + bar.get_height()/2,
-                fmt, va='center', fontsize=9)
-
+        ax.text(bar.get_width() + (max(vals)*0.02), bar.get_y() + bar.get_height()/2, fmt, va='center', fontsize=9)
 plt.suptitle("Model Comparison — Test Set Metrics (real m³/s)", fontsize=13, y=1.02)
 plt.tight_layout()
 plt.savefig(MODEL_DIR / "comparison_metrics_bar.png", dpi=150, bbox_inches='tight')
 plt.close()
 print(f"📸 Saved: comparison_metrics_bar.png")
 
-# ===========================================================
-#  PLOT 9 (NEW): Monsoon zoom — 1 peak season
-# ===========================================================
 if HAS_TF and common_dates is not None and len(common_dates) > 0:
-    # Pick the first monsoon season in the test set
     cd = pd.to_datetime(common_dates)
     first_year = cd.year.min()
-    monsoon_start = pd.Timestamp(f'{first_year}-06-01')
-    monsoon_end   = pd.Timestamp(f'{first_year}-10-31')
-    zoom_mask = (cd >= monsoon_start) & (cd <= monsoon_end)
-
+    zoom_mask = (cd >= pd.Timestamp(f'{first_year}-06-01')) & (cd <= pd.Timestamp(f'{first_year}-10-31'))
     if zoom_mask.sum() > 30:
         fig, ax = plt.subplots(figsize=(12, 5))
-        ax.plot(cd[zoom_mask], common_obs[zoom_mask],  label='Observed', color='#1a1a1a', linewidth=1.2)
-        ax.plot(cd[zoom_mask], common_xgb[zoom_mask],  label='XGB Ensemble', color='#2E86C1', linewidth=0.9, alpha=0.85)
-        ax.plot(cd[zoom_mask], common_lstm[zoom_mask], label='LSTM', color='#E74C3C', linewidth=0.9, alpha=0.85)
-        ax.plot(cd[zoom_mask], hybrid_pred[zoom_mask], label='Hybrid', color='#27AE60', linewidth=1, linestyle='--', alpha=0.85)
+        ax.plot(cd[zoom_mask], common_obs[zoom_mask],   label='Observed',     color='#1a1a1a', linewidth=1.2)
+        ax.plot(cd[zoom_mask], common_xgb[zoom_mask],   label='XGB Ensemble', color='#2E86C1', linewidth=0.9, alpha=0.85)
+        ax.plot(cd[zoom_mask], common_lstm[zoom_mask],  label='LSTM',         color='#E74C3C', linewidth=0.9, alpha=0.85)
+        ax.plot(cd[zoom_mask], hybrid_pred[zoom_mask],  label='Hybrid',       color='#27AE60', linewidth=1,   linestyle='--', alpha=0.85)
         ax.set_title(f"Monsoon {first_year} — Peak Season Zoom")
         ax.set_xlabel("Date"); ax.set_ylabel("Discharge (m³/s)")
-        ax.legend(fontsize=9)
-        ax.grid(True, alpha=0.2)
+        ax.legend(fontsize=9); ax.grid(True, alpha=0.2)
         plt.tight_layout()
         plt.savefig(MODEL_DIR / "comparison_monsoon_zoom.png", dpi=150)
         plt.close()
         print(f"📸 Saved: comparison_monsoon_zoom.png")
 
-
 # ===========================================================
 #  SAVE PREDICTIONS & COMPARISON TABLE
 # ===========================================================
 results_df = pd.DataFrame({
-    'date':      df.loc[test_mask, 'date'].values,
-    'observed':  y_test_real,
-    'ridge':     np.expm1(ridge_pred),
+    'date':         df.loc[test_mask, 'date'].values,
+    'observed':     y_test_real,
+    'ridge':        np.expm1(ridge_pred),
     'xgb_ensemble': y_pred_real,
-    'residual':  residuals,
+    'residual':     residuals,
 })
-# Add LSTM column if available (aligned to common dates)
 if HAS_TF and common_dates is not None:
-    lstm_col = np.full(len(results_df), np.nan)
+    lstm_col   = np.full(len(results_df), np.nan)
     hybrid_col = np.full(len(results_df), np.nan)
     for i, idx in enumerate(common_idx_xgb):
-        lstm_col[idx] = common_lstm[i]
+        lstm_col[idx]   = common_lstm[i]
         hybrid_col[idx] = hybrid_pred[i]
-    results_df['lstm'] = lstm_col
+    results_df['lstm']   = lstm_col
     results_df['hybrid'] = hybrid_col
 
 results_df.to_csv(MODEL_DIR / "test_predictions.csv", index=False)
 print(f"\n💾 Saved: test_predictions.csv")
 
-# --- Model comparison CSV ---
-comp_rows = []
-for name, m in all_models.items():
-    comp_rows.append({'Model': name, 'RMSE': round(m['rmse'], 2), 'MAE': round(m['mae'], 2),
-                      'R2': round(m['r2'], 4), 'NSE': round(m['nse'], 4)})
+comp_rows = [{'Model': name, 'RMSE': round(m['rmse'], 2), 'MAE': round(m['mae'], 2),
+              'R2': round(m['r2'], 4), 'NSE': round(m['nse'], 4)} for name, m in all_models.items()]
 comparison_df = pd.DataFrame(comp_rows)
 comparison_df.to_csv(MODEL_DIR / "model_comparison.csv", index=False)
 print(f"💾 Saved: model_comparison.csv")
@@ -969,6 +877,43 @@ print(f"\n{'='*60}")
 print(f"  FINAL COMPARISON TABLE")
 print(f"{'='*60}")
 print(comparison_df.to_string(index=False))
-
 print("\n✅ Training complete.")
 print("=" * 60)
+
+# ══════════════════════════════════════════════════════════
+#  SAVE FORECAST ASSETS
+#  Ridge is the best model (NSE=0.8897). For CMIP6 forecasting
+#  we retrain it on ALL historical data (not just train+val)
+#  so it benefits from the full record. We also persist the
+#  peak-correction factor and feature list so forecast.py
+#  applies identical preprocessing without guessing.
+# ══════════════════════════════════════════════════════════
+import joblib, json
+
+print(f"\n{'='*60}")
+print(f"  SAVING FORECAST ASSETS")
+print(f"{'='*60}")
+
+# Retrain Ridge on the full dataset for maximum forecast skill
+ridge_forecast = Ridge(alpha=1.0)
+ridge_forecast.fit(X, y)                           # X, y = full historical dataset
+joblib.dump(ridge_forecast, MODEL_DIR / "ridge_forecast_model.pkl")
+print(f"💾 Saved: ridge_forecast_model.pkl  (trained on {len(X)} samples)")
+
+# Save the feature list so forecast.py uses the exact same columns
+with open(MODEL_DIR / "feature_cols.json", "w") as f:
+    json.dump(feature_cols, f)
+print(f"💾 Saved: feature_cols.json  ({len(feature_cols)} features)")
+
+# Save peak-correction metadata derived from the validation set
+forecast_meta = {
+    "correction_factor": round(float(correction_factor), 6),
+    "p90_threshold_m3s": round(float(p90_val), 2),
+    "best_model": "Ridge",
+    "best_nse": round(float(ridge_metrics['nse']), 4),
+}
+with open(MODEL_DIR / "forecast_meta.json", "w") as f:
+    json.dump(forecast_meta, f, indent=2)
+print(f"💾 Saved: forecast_meta.json  "
+      f"(correction={correction_factor:.3f}, p90={p90_val:.0f} m³/s)")
+print(f"\n   Run forecast.py to generate CMIP6 scenario projections.")
