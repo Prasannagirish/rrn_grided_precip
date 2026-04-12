@@ -106,6 +106,38 @@ df['doy_cos']   = np.cos(2 * np.pi * dayofyear / 365)
 df['is_monsoon'] = month.between(6, 9).astype(int)
 
 # --------------------------------------------------
+# FEATURE 6b: ANTECEDENT PRECIPITATION INDEX (API)
+#
+# API is a classic hydrological state variable:
+#   API(t) = k × API(t-1) + P(t)
+# where k = decay constant (related to recession).
+#
+# It acts as a SOIL MOISTURE PROXY — tracks the cumulative
+# effect of recent rainfall with exponential memory.
+# This is the rainfall-only equivalent of discharge lags:
+# it gives the model temporal "state" awareness without
+# needing observed/predicted Q values.
+#
+# We use multiple decay rates to capture different
+# hydrological memory timescales:
+#   fast (k=0.85) — ~4-day half-life (surface runoff)
+#   med  (k=0.92) — ~8-day half-life (interflow)
+#   slow (k=0.97) — ~23-day half-life (baseflow)
+#
+# Shifted by 1 day to prevent leakage (same as rolling features).
+# --------------------------------------------------
+print("⚙️  Building Antecedent Precipitation Index (API) features...")
+rain_vals = df['rainfall_max_mm'].values.astype(float)
+
+for k_val, k_name in [(0.85, 'fast'), (0.92, 'med'), (0.97, 'slow')]:
+    api_raw = np.zeros(len(df))
+    api_raw[0] = rain_vals[0]
+    for t in range(1, len(df)):
+        api_raw[t] = k_val * api_raw[t-1] + rain_vals[t]
+    # Shift by 1 to prevent leakage (use yesterday's API)
+    df[f'api_{k_name}'] = pd.Series(api_raw).shift(1).fillna(0).values
+
+# --------------------------------------------------
 # FEATURE 7: LOG TRANSFORMS
 # Both rainfall and discharge are heavily right-skewed.
 # log1p = log(x + 1), safely handles zeros.
@@ -139,6 +171,10 @@ for window in [7, 14]:
 
 for lag in range(1, 4):
     df[f'log_q_lag_{lag}d'] = np.log1p(df[f'q_lag_{lag}d'])
+
+# Log-transform API features
+for k_name in ['fast', 'med', 'slow']:
+    df[f'log_api_{k_name}'] = np.log1p(df[f'api_{k_name}'])
 
 # --------------------------------------------------
 # DROP WARM-UP ROWS

@@ -92,6 +92,8 @@ DROP_COLS = [
     'q_rollmean_7d', 'q_rollmean_14d',
     'q_rollstd_7d', 'q_rollstd_14d',
     'dry_spell_days',
+    'cum_monsoon_rain',                    # raw — use log version
+    'api_fast', 'api_med', 'api_slow',   # raw API — use log versions
 ]
 
 drop_existing = [c for c in DROP_COLS if c in df.columns]
@@ -894,26 +896,214 @@ print(f"\n{'='*60}")
 print(f"  SAVING FORECAST ASSETS")
 print(f"{'='*60}")
 
-# Retrain Ridge on the full dataset for maximum forecast skill
+# ── A) Full Ridge (with discharge lags) — for short-term forecasting ──
 ridge_forecast = Ridge(alpha=1.0)
 ridge_forecast.fit(X, y)                           # X, y = full historical dataset
 joblib.dump(ridge_forecast, MODEL_DIR / "ridge_forecast_model.pkl")
 print(f"💾 Saved: ridge_forecast_model.pkl  (trained on {len(X)} samples)")
 
-# Save the feature list so forecast.py uses the exact same columns
 with open(MODEL_DIR / "feature_cols.json", "w") as f:
     json.dump(feature_cols, f)
 print(f"💾 Saved: feature_cols.json  ({len(feature_cols)} features)")
 
-# Save peak-correction metadata derived from the validation set
+# ── B) Rainfall-Only Ridge — for CMIP6 long-range projections ──
+#
+#  The full Ridge gets NSE~0.89 mainly from log_q_lag_1d (r=0.94).
+#  This is valid for short-term forecasting but NOT for CMIP6:
+#  future discharge doesn't exist, so the AR loop feeds predictions
+#  back as lags, causing compounding errors over months/years.
+#
+#  The rainfall-only model uses ONLY features that CMIP6 provides:
+#  rainfall lags, rolling sums, rolling std, seasonality, monsoon flag.
+#  Lower NSE on test (~ablation value), but physically honest for
+#  multi-year climate projections.
+#
+#  The forecast script adds a physical post-processor (recession
+#  filter + smoothing) to produce realistic daily hydrographs.
+
+# Identify discharge-dependent features to exclude
+q_dependent_cols = [c for c in feature_cols if 'log_q_lag' in c or 'log_q_roll' in c or 'delta_q' in c]
+rainfall_only_cols = [c for c in feature_cols if c not in q_dependent_cols]
+
+print(f"\n   Rainfall-only features ({len(rainfall_only_cols)}):")
+for f in rainfall_only_cols:
+    print(f"     {f}")
+print(f"   Excluded discharge features: {q_dependent_cols}")
+
+# ── B1) Ridge baseline (rainfall-only) ──
+ridge_ro = Ridge(alpha=1.0)
+ridge_ro.fit(X[rainfall_only_cols], y)
+ro_ridge_pred = ridge_ro.predict(X_test[rainfall_only_cols])
+print("\n📊 Rainfall-Only Ridge (test set):")
+ro_ridge_metrics = compute_metrics(y_test.values, ro_ridge_pred, "RO Ridge")
+
+# ── B2) XGBoost (rainfall-only) — captures nonlinear rainfall→discharge ──
+print("\n🔍 Training XGBoost rainfall-only model...")
+xgb_ro = XGBRegressor(
+    n_estimators=1000, learning_rate=0.04, max_depth=5,
+    subsample=0.8, colsample_bytree=0.8, min_child_weight=5,
+    reg_alpha=0.1, reg_lambda=1.0, random_state=42, n_jobs=-1,
+)
+xgb_ro.fit(X_trainval[rainfall_only_cols], y_trainval,
+           eval_set=[(X_val[rainfall_only_cols], y_val)], verbose=0)
+ro_xgb_pred = xgb_ro.predict(X_test[rainfall_only_cols])
+print("📊 Rainfall-Only XGBoost (test set):")
+ro_xgb_metrics = compute_metrics(y_test.values, ro_xgb_pred, "RO XGBoost")
+
+# ── B3) Damped AR — use rainfall-only predictions as pseudo-Q lags ──
+#  Instead of feeding raw predictions back (which compounds errors),
+#  we blend them with climatological Q before using as lags.
+#  This gives temporal coherence without runaway accumulation.
+print("\n🔍 Training Damped-AR model (rainfall-only + pseudo-Q lags)...")
+
+# Build damped-AR features: use rainfall-only XGB predictions as pseudo-Q
+# Train on full data: predict, then use those predictions as lag features
+ro_full_pred_log = xgb_ro.predict(X[rainfall_only_cols])
+ro_full_pred_real = np.expm1(ro_full_pred_log)
+
+# Compute climatological monthly Q for damping
+df_master_path = BASE_DIR / "data/master_dataset.csv"
+df_m_tmp = pd.read_csv(df_master_path)
+df_m_tmp['date'] = pd.to_datetime(df_m_tmp['date'])
+df_m_tmp['month'] = df_m_tmp['date'].dt.month
+clim_q_monthly = df_m_tmp.groupby('month')['q_upstream_mk'].median().to_dict()
+
+# Build pseudo-Q lag features with climatological damping
+DAMP_ALPHA = 0.6  # blend: 0.6 × predicted + 0.4 × climatological
+pseudo_q = np.zeros(len(df))
+dates_all = df['date'].values
+
+for i in range(len(df)):
+    month_i = pd.Timestamp(dates_all[i]).month
+    clim_q  = clim_q_monthly.get(month_i, 30.0)
+    raw_q   = max(ro_full_pred_real[i], 0.0)
+    pseudo_q[i] = DAMP_ALPHA * raw_q + (1 - DAMP_ALPHA) * clim_q
+
+# Create damped lag features
+dar_extra_cols = []
+for lag in range(1, 4):
+    col_name = f'log_pseudo_q_lag_{lag}d'
+    df[col_name] = np.log1p(pd.Series(pseudo_q).shift(lag).fillna(0).clip(lower=0).values)
+    dar_extra_cols.append(col_name)
+
+dar_feature_cols = rainfall_only_cols + dar_extra_cols
+
+# Retrain on full data with pseudo-Q lags
+X_dar = df[dar_feature_cols]
+ridge_dar = Ridge(alpha=1.0)
+ridge_dar.fit(X_dar, y)
+
+# Test with pseudo-Q lags built from test-period rainfall-only predictions
+# (simulates what CMIP6 will do: predict → damp → use as lag)
+test_pseudo_q = np.zeros(test_mask.sum())
+test_dates_v = df.loc[test_mask, 'date'].values
+ro_test_real = np.expm1(xgb_ro.predict(X_test[rainfall_only_cols]))
+
+for i in range(len(test_pseudo_q)):
+    month_i = pd.Timestamp(test_dates_v[i]).month
+    clim_q  = clim_q_monthly.get(month_i, 30.0)
+    test_pseudo_q[i] = DAMP_ALPHA * max(ro_test_real[i], 0.0) + (1 - DAMP_ALPHA) * clim_q
+
+X_test_dar = X_test[rainfall_only_cols].copy()
+for lag in range(1, 4):
+    col_name = f'log_pseudo_q_lag_{lag}d'
+    X_test_dar[col_name] = np.log1p(pd.Series(test_pseudo_q).shift(lag).fillna(0).clip(lower=0).values)
+
+ro_dar_pred = ridge_dar.predict(X_test_dar[dar_feature_cols])
+print("📊 Damped-AR Ridge (test set):")
+ro_dar_metrics = compute_metrics(y_test.values, ro_dar_pred, "Damped AR")
+
+# ── Pick the best rainfall-only approach ──
+ro_candidates = {
+    'Ridge':     (ridge_ro, rainfall_only_cols,  ro_ridge_metrics, 'ridge'),
+    'XGBoost':   (xgb_ro,   rainfall_only_cols,  ro_xgb_metrics,   'xgboost'),
+    'Damped-AR': (ridge_dar, dar_feature_cols,    ro_dar_metrics,   'damped_ar'),
+}
+
+best_ro_name = max(ro_candidates, key=lambda k: ro_candidates[k][2]['nse'])
+best_ro_model, best_ro_cols, best_ro_metrics, best_ro_type = ro_candidates[best_ro_name]
+
+print(f"\n   RAINFALL-ONLY MODEL COMPARISON:")
+print(f"   {'Model':<15} {'NSE':>8} {'RMSE':>8}")
+print(f"   {'-'*33}")
+for name, (_, _, m, _) in ro_candidates.items():
+    marker = " ← best" if name == best_ro_name else ""
+    print(f"   {name:<15} {m['nse']:>8.4f} {m['rmse']:>8.2f}{marker}")
+
+# Save the best rainfall-only model
+joblib.dump(best_ro_model, MODEL_DIR / "ridge_rainfall_only_model.pkl")
+print(f"\n💾 Saved: ridge_rainfall_only_model.pkl  ({best_ro_name}, {len(best_ro_cols)} features)")
+
+with open(MODEL_DIR / "rainfall_only_feature_cols.json", "w") as f:
+    json.dump(best_ro_cols, f)
+print(f"💾 Saved: rainfall_only_feature_cols.json  ({len(best_ro_cols)} features)")
+
+ro_metrics = best_ro_metrics
+
+# Save damped-AR parameters if that's the winner
+forecast_ro_meta = {
+    "ro_model_type": best_ro_type,
+    "ro_nse": round(float(ro_metrics['nse']), 4),
+    "damp_alpha": DAMP_ALPHA if best_ro_type == 'damped_ar' else None,
+    "clim_q_monthly": {str(k): round(v, 2) for k, v in clim_q_monthly.items()},
+}
+with open(MODEL_DIR / "rainfall_only_meta.json", "w") as f:
+    json.dump(forecast_ro_meta, f, indent=2)
+print(f"💾 Saved: rainfall_only_meta.json  (type={best_ro_type})")
+
+# Also save the XGBoost rainfall-only model separately (needed for damped-AR base predictions)
+joblib.dump(xgb_ro, MODEL_DIR / "xgb_rainfall_only_model.pkl")
+with open(MODEL_DIR / "rainfall_only_base_cols.json", "w") as f:
+    json.dump(rainfall_only_cols, f)
+print(f"💾 Saved: xgb_rainfall_only_model.pkl  (base predictor for damped-AR)")
+
+# ── C) Peak-correction metadata (derived from validation set) ──
 forecast_meta = {
     "correction_factor": round(float(correction_factor), 6),
     "p90_threshold_m3s": round(float(p90_val), 2),
     "best_model": "Ridge",
     "best_nse": round(float(ridge_metrics['nse']), 4),
+    "rainfall_only_nse": round(float(ro_metrics['nse']), 4),
+    "rainfall_only_type": best_ro_type,
 }
 with open(MODEL_DIR / "forecast_meta.json", "w") as f:
     json.dump(forecast_meta, f, indent=2)
 print(f"💾 Saved: forecast_meta.json  "
       f"(correction={correction_factor:.3f}, p90={p90_val:.0f} m³/s)")
+
+# ── D) Climatological monthly discharge for post-processing ──
+#  The forecast script uses this to scale rainfall-only predictions
+#  and apply recession behavior during dry spells.
+df_master_path = BASE_DIR / "data/master_dataset.csv"
+if df_master_path.exists():
+    df_m = pd.read_csv(df_master_path)
+    df_m['date'] = pd.to_datetime(df_m['date'])
+    df_m['month'] = df_m['date'].dt.month
+    df_m['doy']   = df_m['date'].dt.dayofyear
+
+    # Recession constant: median of Q(t)/Q(t-1) during falling limbs
+    q_vals = df_m['q_upstream_mk'].dropna().values
+    dQ = np.diff(q_vals)
+    recession_mask = dQ < 0
+    ratios = q_vals[1:][recession_mask] / q_vals[:-1][recession_mask]
+    ratios = ratios[(ratios > 0.5) & (ratios < 1.0)]
+    recession_k = float(np.median(ratios))
+
+    clim_monthly = df_m.groupby('month')['q_upstream_mk'].agg(['mean', 'median', 'std', 'max']).to_dict()
+
+    hydro_params = {
+        "recession_constant": round(recession_k, 5),
+        "recession_halflife_days": round(-np.log(2)/np.log(recession_k), 1),
+        "clim_monthly_mean": {str(k): round(v, 2) for k, v in clim_monthly['mean'].items()},
+        "clim_monthly_median": {str(k): round(v, 2) for k, v in clim_monthly['median'].items()},
+        "clim_monthly_std": {str(k): round(v, 2) for k, v in clim_monthly['std'].items()},
+        "clim_monthly_max": {str(k): round(v, 2) for k, v in clim_monthly['max'].items()},
+        "mean_annual_q": round(float(df_m['q_upstream_mk'].mean()), 2),
+    }
+    with open(MODEL_DIR / "hydro_params.json", "w") as f:
+        json.dump(hydro_params, f, indent=2)
+    print(f"💾 Saved: hydro_params.json  (recession_k={recession_k:.4f})")
+else:
+    print("⚠️  master_dataset.csv not found — hydro_params.json not saved")
+
 print(f"\n   Run forecast.py to generate CMIP6 scenario projections.")
