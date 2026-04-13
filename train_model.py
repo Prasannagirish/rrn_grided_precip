@@ -1,10 +1,4 @@
-# ──────────────────────────────────────────────────────────
-#  FIX 1: Seeds must be set BEFORE any library imports.
-#  Setting them inside the script body (after TF is imported)
-#  has no effect on weight initialisation or dropout masks.
-#  PYTHONHASHSEED must also be exported in the shell:
-#      PYTHONHASHSEED=50 python train_model.py
-# ──────────────────────────────────────────────────────────
+
 import os
 import random
 os.environ['PYTHONHASHSEED'] = '50'   # effective only if set before interpreter start,
@@ -166,9 +160,6 @@ if HAS_OPTUNA:
         m.fit(X_train, y_train, eval_set=[(X_val, y_val)], verbose=0)
         return mean_squared_error(y_val, m.predict(X_val))
 
-    # FIX: n_startup_trials=20 forces random exploration before TPE exploitation,
-    # preventing the seeded sampler from converging on hyperparams that fit the
-    # val period (2012-2014) but don't generalise to the test period (2015-2020).
     study = optuna.create_study(
         direction='minimize',
         sampler=optuna.samplers.TPESampler(seed=42, n_startup_trials=20)
@@ -262,8 +253,6 @@ if HAS_LGB:
         reg_alpha=best_params.get('reg_alpha', 0.1), reg_lambda=best_params.get('reg_lambda', 1.0),
         random_state=42, n_jobs=-1, verbose=-1,
     )
-    # FIX 4 cont.: Final LightGBM also needs early stopping. Since we've already
-    # used val for early stopping, this is consistent with XGBoost's treatment.
     lgb_model.fit(
         X_trainval, y_trainval,
         eval_set=[(X_val, y_val)],
@@ -281,14 +270,10 @@ ridge_pred = ridge_model.predict(X_test)
 print("📊 Ridge:")
 ridge_metrics = compute_metrics(y_test.values, ridge_pred, "Ridge (test)")
 
-# FIX 6: Ridge val/test gap must use the TRAIN-ONLY Ridge predicting on val
-# (out-of-sample). Using ridge_model (trained on train+val) to predict on val
-# is in-sample and will always show an artificially inflated val R².
 ridge_val_oos = ridge_trainonly.predict(X_val)
 ridge_val_metrics = compute_metrics(y_val.values, ridge_val_oos, "Ridge (val, OOS)")
 val_test_gap = ridge_val_metrics['r2'] - ridge_metrics['r2']
-# FIX 7: Positive gap (val > test) is normal. Only flag NEGATIVE gaps
-# (val < test), which would suggest test-period-specific overfitting.
+
 if val_test_gap < -0.05:
     print(f"   ⚠️  Val R² LOWER than test by {-val_test_gap:.4f} — possible distribution shift")
 else:
@@ -385,14 +370,6 @@ if 'log_q_lag_1d' in feature_cols:
 ablation_df.to_csv(MODEL_DIR / "ablation_results.csv", index=False)
 print(f"💾 Saved: ablation_results.csv")
 
-
-# ══════════════════════════════════════════════════════════
-#  PEAK FLOW BIAS CORRECTION
-#  Correction factor derived from VALIDATION set only.
-#  Applied to predicted peaks (not observed) for forecast realism.
-#  FIX 8: Both the correction factor AND the application mask
-#  now use the same val-derived P90 threshold consistently.
-# ══════════════════════════════════════════════════════════
 ridge_val_pred_real = np.expm1(ridge_trainonly.predict(X_val))
 y_val_real          = np.expm1(y_val.values)
 
@@ -435,10 +412,6 @@ if HAS_TF:
     print("  PART B: LSTM Model")
     print("=" * 60)
 
-    # NOTE: tf.random.set_seed(50) and np.random.seed(50) were already
-    # called at the top of the script, before TF was imported.
-    # No need to re-seed here — doing so would reset the RNG state
-    # and could cause unexpected interactions with the XGB training above.
 
     LOOKBACK = 30
 
@@ -471,16 +444,7 @@ if HAS_TF:
 
     n_features = X_lstm_train.shape[2]
 
-    # FIX 2 cont.: l2 is already imported from tensorflow.keras.regularizers
-    # at the top — no inner import needed (and the old inner import used the
-    # standalone keras package which may not be installed or may conflict).
-    # LSTM architecture: moderate regularization.
-    # Run 7 was over-regularized (L2 + dropout + recurrent_dropout → floor at val 0.187).
-    # Run 8 was under-regularized (no recurrent_dropout, low dropout → best epoch 7, overfit).
-    # Middle ground: moderate dropout + recurrent_dropout (0.1), NO L2.
-    # L2 and dropout together over-constrain on ~8000 samples.
-    # Batch size 64 (was 32) for more stable gradient estimates — reduces val loss noise
-    # that was causing early stopping to grab a spurious best-epoch dip.
+
     lstm_model = Sequential([
         LSTM(128, input_shape=(LOOKBACK, n_features),
              dropout=0.2, recurrent_dropout=0.1),
@@ -523,15 +487,11 @@ if HAS_TF:
     plt.close()
     print(f"📸 Saved: lstm_training_history.png")
 
-    # ── Hybrid weight: optimised on VALIDATION SET, applied to test ──
-    # FIX 9: Previous code searched for best_hw using common_obs (TEST labels).
-    # That is test-set snooping. We now use the val set exclusively.
     lstm_val_pred   = lstm_model.predict(X_lstm_val, verbose=0).flatten()
     lstm_val_dates  = seq_dates[seq_val]
     xgb_val_dates   = df.loc[val_mask, 'date'].values
     xgb_val_real    = np.expm1(y_val.values)
 
-    # Reconstruct val-set ensemble predictions using locked train-only weights
     if HAS_LGB and best_w[1] > 0.0:
         xgb_ens_val_real = np.expm1(best_w[0]*xgb_val_pred + best_w[1]*lgb_val_pred + best_w[2]*ridge_val_pred)
     else:
@@ -937,27 +897,55 @@ ro_ridge_pred = ridge_ro.predict(X_test[rainfall_only_cols])
 print("\n📊 Rainfall-Only Ridge (test set):")
 ro_ridge_metrics = compute_metrics(y_test.values, ro_ridge_pred, "RO Ridge")
 
-# ── B2) XGBoost (rainfall-only) — captures nonlinear rainfall→discharge ──
-print("\n🔍 Training XGBoost rainfall-only model...")
-xgb_ro = XGBRegressor(
-    n_estimators=1000, learning_rate=0.04, max_depth=5,
-    subsample=0.8, colsample_bytree=0.8, min_child_weight=5,
-    reg_alpha=0.1, reg_lambda=1.0, random_state=42, n_jobs=-1,
-)
+# ── B2) XGBoost (rainfall-only) — Optuna-tuned for the rainfall feature space ──
+if HAS_OPTUNA:
+    print("\n🔍 Tuning Rainfall-Only XGBoost with Optuna (80 trials)...")
+    def ro_objective(trial):
+        params = {
+            'n_estimators': 1000,
+            'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.15, log=True),
+            'max_depth': trial.suggest_int('max_depth', 4, 10),
+            'subsample': trial.suggest_float('subsample', 0.6, 1.0),
+            'colsample_bytree': trial.suggest_float('colsample_bytree', 0.4, 1.0),
+            'min_child_weight': trial.suggest_int('min_child_weight', 1, 30),
+            'reg_alpha': trial.suggest_float('reg_alpha', 1e-4, 10, log=True),
+            'reg_lambda': trial.suggest_float('reg_lambda', 1e-4, 10, log=True),
+            'gamma': trial.suggest_float('gamma', 0.0, 2.0),
+            'random_state': 42, 'n_jobs': -1,
+        }
+        m = XGBRegressor(**params)
+        m.fit(X_train[rainfall_only_cols], y_train,
+              eval_set=[(X_val[rainfall_only_cols], y_val)], verbose=0)
+        return mean_squared_error(y_val, m.predict(X_val[rainfall_only_cols]))
+
+    ro_study = optuna.create_study(
+        direction='minimize',
+        sampler=optuna.samplers.TPESampler(seed=42, n_startup_trials=20)
+    )
+    ro_study.optimize(ro_objective, n_trials=80, show_progress_bar=False)
+    ro_best_params = {**ro_study.best_params, 'n_estimators': 1000, 'random_state': 42, 'n_jobs': -1}
+    print(f"   Best val MSE: {ro_study.best_value:.6f}")
+    print(f"   Best params: max_depth={ro_best_params['max_depth']}, "
+          f"lr={ro_best_params['learning_rate']:.4f}, "
+          f"gamma={ro_best_params.get('gamma', 0):.3f}")
+else:
+    ro_best_params = {
+        'n_estimators': 1000, 'learning_rate': 0.04, 'max_depth': 6,
+        'subsample': 0.8, 'colsample_bytree': 0.7, 'min_child_weight': 10,
+        'reg_alpha': 0.5, 'reg_lambda': 2.0, 'gamma': 0.5,
+        'random_state': 42, 'n_jobs': -1,
+    }
+
+xgb_ro = XGBRegressor(**ro_best_params)
 xgb_ro.fit(X_trainval[rainfall_only_cols], y_trainval,
            eval_set=[(X_val[rainfall_only_cols], y_val)], verbose=0)
 ro_xgb_pred = xgb_ro.predict(X_test[rainfall_only_cols])
 print("📊 Rainfall-Only XGBoost (test set):")
 ro_xgb_metrics = compute_metrics(y_test.values, ro_xgb_pred, "RO XGBoost")
 
-# ── B3) Damped AR — use rainfall-only predictions as pseudo-Q lags ──
-#  Instead of feeding raw predictions back (which compounds errors),
-#  we blend them with climatological Q before using as lags.
-#  This gives temporal coherence without runaway accumulation.
+
 print("\n🔍 Training Damped-AR model (rainfall-only + pseudo-Q lags)...")
 
-# Build damped-AR features: use rainfall-only XGB predictions as pseudo-Q
-# Train on full data: predict, then use those predictions as lag features
 ro_full_pred_log = xgb_ro.predict(X[rainfall_only_cols])
 ro_full_pred_real = np.expm1(ro_full_pred_log)
 
@@ -993,8 +981,7 @@ X_dar = df[dar_feature_cols]
 ridge_dar = Ridge(alpha=1.0)
 ridge_dar.fit(X_dar, y)
 
-# Test with pseudo-Q lags built from test-period rainfall-only predictions
-# (simulates what CMIP6 will do: predict → damp → use as lag)
+
 test_pseudo_q = np.zeros(test_mask.sum())
 test_dates_v = df.loc[test_mask, 'date'].values
 ro_test_real = np.expm1(xgb_ro.predict(X_test[rainfall_only_cols]))

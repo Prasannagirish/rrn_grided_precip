@@ -108,23 +108,21 @@ df['is_monsoon'] = month.between(6, 9).astype(int)
 # --------------------------------------------------
 # FEATURE 6b: ANTECEDENT PRECIPITATION INDEX (API)
 #
-# API is a classic hydrological state variable:
+# API is the classic hydrological soil-moisture proxy:
 #   API(t) = k × API(t-1) + P(t)
 # where k = decay constant (related to recession).
 #
-# It acts as a SOIL MOISTURE PROXY — tracks the cumulative
-# effect of recent rainfall with exponential memory.
-# This is the rainfall-only equivalent of discharge lags:
-# it gives the model temporal "state" awareness without
-# needing observed/predicted Q values.
+# It gives the model temporal "state" awareness — the
+# cumulative effect of recent rainfall with exponential
+# memory — without needing observed discharge values.
+# This is the rainfall-only equivalent of discharge lags.
 #
-# We use multiple decay rates to capture different
-# hydrological memory timescales:
-#   fast (k=0.85) — ~4-day half-life (surface runoff)
-#   med  (k=0.92) — ~8-day half-life (interflow)
+# Multiple decay rates capture different timescales:
+#   fast (k=0.85) — ~4-day half-life  (surface runoff)
+#   med  (k=0.92) — ~8-day half-life  (interflow)
 #   slow (k=0.97) — ~23-day half-life (baseflow)
 #
-# Shifted by 1 day to prevent leakage (same as rolling features).
+# Shifted by 1 day to prevent leakage.
 # --------------------------------------------------
 print("⚙️  Building Antecedent Precipitation Index (API) features...")
 rain_vals = df['rainfall_max_mm'].values.astype(float)
@@ -136,6 +134,40 @@ for k_val, k_name in [(0.85, 'fast'), (0.92, 'med'), (0.97, 'slow')]:
         api_raw[t] = k_val * api_raw[t-1] + rain_vals[t]
     # Shift by 1 to prevent leakage (use yesterday's API)
     df[f'api_{k_name}'] = pd.Series(api_raw).shift(1).fillna(0).values
+
+# --------------------------------------------------
+# FEATURE 6c: DRY SPELL LENGTH
+# Number of consecutive days with rainfall < 1mm.
+# Captures basin drying — longer dry spell = lower base flow.
+# --------------------------------------------------
+print("⚙️  Building dry spell length feature...")
+dry_spell = np.zeros(len(df))
+for t in range(1, len(df)):
+    if rain_vals[t] < 1.0:
+        dry_spell[t] = dry_spell[t-1] + 1
+    else:
+        dry_spell[t] = 0
+df['dry_spell_days'] = dry_spell
+
+# --------------------------------------------------
+# FEATURE 6d: CUMULATIVE MONSOON RAINFALL
+# Running sum of rainfall since June 1 each year.
+# Resets at start of each monsoon season.
+# Captures seasonal soil saturation buildup.
+# --------------------------------------------------
+print("⚙️  Building cumulative monsoon rainfall feature...")
+cum_monsoon = np.zeros(len(df))
+for t in range(1, len(df)):
+    m = df['date'].iloc[t].month
+    d = df['date'].iloc[t].day
+    # Reset on June 1
+    if m == 6 and d == 1:
+        cum_monsoon[t] = rain_vals[t]
+    elif 6 <= m <= 11:  # Accumulate Jun–Nov
+        cum_monsoon[t] = cum_monsoon[t-1] + rain_vals[t]
+    else:
+        cum_monsoon[t] = 0.0
+df['cum_monsoon_rain'] = pd.Series(cum_monsoon).shift(1).fillna(0).values
 
 # --------------------------------------------------
 # FEATURE 7: LOG TRANSFORMS
@@ -175,6 +207,30 @@ for lag in range(1, 4):
 # Log-transform API features
 for k_name in ['fast', 'med', 'slow']:
     df[f'log_api_{k_name}'] = np.log1p(df[f'api_{k_name}'])
+
+# Log-transform dry spell and cumulative monsoon rain
+df['log_dry_spell'] = np.log1p(df['dry_spell_days'])
+df['log_cum_monsoon'] = np.log1p(df['cum_monsoon_rain'])
+
+# --------------------------------------------------
+# FEATURE 8: INTERACTION FEATURES
+#
+# These help tree models find the key nonlinear thresholds:
+#   - Wet soil + heavy rain → big runoff (API × rain)
+#   - Monsoon context changes the rainfall-runoff relationship
+#   - Saturated soil + continued rain → extreme peaks
+# --------------------------------------------------
+print("⚙️  Building interaction features...")
+
+# API × recent rainfall — "wet soil + rain event" signal
+df['api_slow_x_rain7d'] = df['log_api_slow'] * df['log_rain_roll_7d']
+df['api_med_x_rain3d']  = df['log_api_med']  * df['log_rain_roll_3d']
+
+# API × monsoon flag — monsoon API behaves differently from dry-season API
+df['api_slow_x_monsoon'] = df['log_api_slow'] * df['is_monsoon']
+
+# Cumulative monsoon × recent rain — "saturated basin + more rain"
+df['cum_monsoon_x_rain7d'] = df['log_cum_monsoon'] * df['log_rain_roll_7d']
 
 # --------------------------------------------------
 # DROP WARM-UP ROWS

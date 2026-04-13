@@ -1,6 +1,6 @@
 {
-  "ro_model_type": "xgboost",
-  "ro_nse": 0.3236,
+  "ro_model_type": "ridge",
+  "ro_nse": 0.3462,
   "damp_alpha": null,
   "clim_q_monthly": {
     "1": 8.31,

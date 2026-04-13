@@ -1,8 +1,8 @@
 {
-  "correction_factor": 1.105147,
+  "correction_factor": 1.096222,
   "p90_threshold_m3s": 237.98,
   "best_model": "Ridge",
-  "best_nse": 0.8884,
-  "rainfall_only_nse": 0.3236,
-  "rainfall_only_type": "xgboost"
+  "best_nse": 0.8914,
+  "rainfall_only_nse": 0.3462,
+  "rainfall_only_type": "ridge"
 }

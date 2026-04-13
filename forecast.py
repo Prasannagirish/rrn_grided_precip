@@ -246,6 +246,12 @@ def precompute_rain_features(dates_series, rain_series, rain_std_series=None):
     df_c['doy_cos']    = np.cos(2 * np.pi * pd.Series(dates).dt.dayofyear / 365).values
     df_c['is_monsoon'] = (pd.Series(dates).dt.month.between(6, 9)).astype(int).values
 
+    # Interaction features
+    df_c['api_slow_x_rain7d']    = df_c['log_api_slow'] * df_c['log_rain_roll_7d']
+    df_c['api_med_x_rain3d']     = df_c['log_api_med']  * df_c['log_rain_roll_3d']
+    df_c['api_slow_x_monsoon']   = df_c['log_api_slow'] * df_c['is_monsoon']
+    df_c['cum_monsoon_x_rain7d'] = df_c['log_cum_monsoon'] * df_c['log_rain_roll_7d']
+
     return df_c.reset_index(drop=True)
 
 
